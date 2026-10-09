@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="fr-FR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hi-Market - Gestion Supermarché</title>
+
+    <!-- PWA : Manifest & thème -->
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="theme-color" content="#0f172a" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Hi-Market" />
+    <meta name="application-name" content="Hi-Market" />
+    <meta name="msapplication-TileColor" content="#0f172a" />
+
+    <!-- Description & SEO -->
+    <meta name="description" content="Hi-Market — Application de gestion de supermarché : ventes, stocks, achats, clients, inventaire et rapports." />
+
+    <!-- Icônes -->
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+
+    <!-- Enregistrement du Service Worker -->
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', function () {
+          navigator.serviceWorker
+            .register('/sw.js', { scope: '/' })
+            .then(function (reg) {
+              console.log('[Hi-Market] Service Worker enregistré :', reg.scope);
+            })
+            .catch(function (err) {
+              console.warn('[Hi-Market] Service Worker non enregistré :', err);
+            });
+        });
+      }
+    </script>
+  </body>
+</html>

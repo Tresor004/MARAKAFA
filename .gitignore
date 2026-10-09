@@ -1,0 +1,35 @@
+# Dépendances JavaScript
+
+/node_modules/
+
+# Fichiers générés par Vite
+
+/dist/
+/build/
+
+# Variables d'environnement et secrets
+
+.env
+.env.*
+!.env.example
+
+# Journaux
+
+*.log
+
+# Fichiers système
+
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Éditeurs et outils de développement
+
+.vscode/
+.idea/
+.cursor/
+
+# Fichiers temporaires
+
+*.tmp
+*.bak

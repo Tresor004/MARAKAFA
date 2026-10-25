@@ -26,6 +26,9 @@ class UserFactory extends Factory
     {
         return [
             'name' => fake()->name(),
+            'phone' => fake()->numerify('77 ### ## ##'),
+            'role_id' => \App\Models\Role::where('slug', 'caissier')->value('id'),
+            'active' => true,
             'email' => fake()->unique()->safeEmail(),
             'email_verified_at' => now(),
             'password' => static::$password ??= Hash::make('password'),

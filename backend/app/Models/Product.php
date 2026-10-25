@@ -12,15 +12,16 @@ class Product extends Model
     use SoftDeletes;
 
     protected $fillable = [
-        'name', 'category_id', 'price', 'cost',
+        'name', 'category_id', 'price', 'cost', 'tax_rate',
         'stock', 'min_stock', 'unit', 'barcode', 'expiry_date',
     ];
 
     protected $casts = [
         'price'       => 'float',
         'cost'        => 'float',
-        'stock'       => 'integer',
-        'min_stock'   => 'integer',
+        'tax_rate'    => 'float',
+        'stock'       => 'float',
+        'min_stock'   => 'float',
         'expiry_date' => 'date',
     ];
 

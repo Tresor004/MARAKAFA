@@ -16,7 +16,7 @@ return new class extends Migration
             $table->string('password');                      // bcrypt
             $table->foreignId('role_id')->constrained()->restrictOnDelete();
             $table->boolean('active')->default(true);
-            $table->string('avatar_path')->nullable();       // chemin sur le disque
+            $table->longText('avatar')->nullable();          // miniature (data-URL) de la photo de profil
             $table->timestamp('last_seen_at')->nullable();   // présence en ligne
             $table->rememberToken();
             $table->timestamps();

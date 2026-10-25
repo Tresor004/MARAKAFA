@@ -49,7 +49,7 @@ export default function MySpace({ navigate }: MySpaceProps) {
   const {
     pendingActions, approveAction, rejectAction,
     isAdmin, currentUser, myNotifications, unreadCount,
-    markAllRead, markRead, updateProfile, roleName,
+    markAllRead, markRead, updateProfile, roleName, verifyPassword,
   } = useStore();
   const { push } = useToast();
 
@@ -112,7 +112,7 @@ export default function MySpace({ navigate }: MySpaceProps) {
       variant: "primary",
     });
     if (!ok) return;
-    approveAction(pa.id);
+    if (!(await approveAction(pa.id))) return;   // erreur serveur déjà affichée (ex. stock devenu insuffisant)
     push(`✓ Demande de ${pa.requestedByName} approuvée et appliquée`);
     setDetail(null);
   };
@@ -129,7 +129,7 @@ export default function MySpace({ navigate }: MySpaceProps) {
       variant: "danger",
     });
     if (!ok) return;
-    rejectAction(rejectId, rejectReason || "Non approuvé");
+    if (!(await rejectAction(rejectId, rejectReason || "Non approuvé"))) return;
     push("Demande refusée", "error");
     setRejectModal(false); setRejectId(null);
   };
@@ -182,19 +182,21 @@ export default function MySpace({ navigate }: MySpaceProps) {
   const confirmProfileUpdate = async () => {
     if (!currentUser) return;
     if (!currentPwdInput) { setPwdError("Veuillez saisir votre mot de passe actuel."); return; }
-    if (currentPwdInput !== currentUser.password) {
-      setPwdError("Mot de passe incorrect.");
-      return;
-    }
     setSubmittingProfile(true);
     try {
-      const immediate = await updateProfile({
+      // Le mot de passe n'existe jamais côté navigateur : c'est le serveur qui le vérifie.
+      if (!(await verifyPassword(currentPwdInput))) {
+        setPwdError("Mot de passe incorrect.");
+        return;
+      }
+      const result = await updateProfile({
         name: pName.trim(),
         email: pEmail.trim(),
         password: pPassword || undefined,
         avatar: pAvatar,
       });
-      push(immediate ? "Profil mis à jour" : "Demande envoyée — en attente de validation de l'administrateur");
+      if (result === "error") return;
+      push(result === "done" ? "Profil mis à jour" : "Demande envoyée — en attente de validation de l'administrateur");
       setPPassword("");
       setProfileConfirmOpen(false);
     } catch {

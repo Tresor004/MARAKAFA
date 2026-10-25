@@ -1,10 +1,31 @@
 import { useState } from "react";
 import { useStore, fmtCurrency, fmtDate } from "../store";
-import { PurchaseItem, Product, Purchase } from "../types";
+import { Product, Purchase } from "../types";
 import { Card, Button, Modal, Field, inputClass, EmptyState, Badge, SearchSelect } from "../components/ui";
 import { IconPlus, IconTrash, IconSearch, IconDownload, IconEdit } from "../components/Icons";
 import { useToast, useConfirm } from "../components/ui";
 import jsPDF from "jspdf";
+
+function PriceMode({ value, onChange }: { value: "ht" | "ttc"; onChange: (m: "ht" | "ttc") => void }) {
+  return (
+    <div className="inline-flex mt-1 rounded-md border border-slate-200 overflow-hidden text-[10px] font-bold" role="group" aria-label="Le prix saisi est">
+      {(["ht", "ttc"] as const).map(m => (
+        <button key={m} type="button" onClick={() => onChange(m)} className={`px-2 py-0.5 ${value === m ? "bg-slate-900 text-white" : "bg-white text-slate-600"}`}>{m.toUpperCase()}</button>
+      ))}
+    </div>
+  );
+}
+
+/** Ligne de saisie : le prix peut être saisi HT ou TTC ; le serveur recalcule tout (HT, TVA, TTC) et reste l'autorité. */
+interface Line { productId: string; name: string; quantity: number; price: number; taxRate: number; priceMode: "ht" | "ttc" }
+
+const r2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+function calc(l: Line) {
+  const unitHt = l.priceMode === "ttc" ? l.price / (1 + l.taxRate / 100) : l.price;
+  const ht = r2(l.quantity * unitHt);
+  const ttc = r2(ht * (1 + l.taxRate / 100));
+  return { unitHt: r2(unitHt), ht, ttc, tax: r2(ttc - ht) };
+}
 
 export default function Purchases() {
   const { products, purchases, suppliers, shopSettings: ss, currentUser, requestOrExec } = useStore();
@@ -15,42 +36,45 @@ export default function Purchases() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [supplierId, setSupplierId] = useState("");
-  const [items, setItems] = useState<PurchaseItem[]>([]);
+  const [items, setItems] = useState<Line[]>([]);
 
-  const total = items.reduce((a, b) => a + b.total, 0);
+  const totals = items.reduce((a, l) => { const c = calc(l); return { ht: a.ht + c.ht, ttc: a.ttc + c.ttc }; }, { ht: 0, ttc: 0 });
+  const total = r2(totals.ttc);
   const filteredProducts = products.filter(p => p.name.toLowerCase().includes(search.toLowerCase()));
   const isEditing = !!editingId;
 
   const openAdd = () => { setEditingId(null); setItems([]); setSupplierId(""); setSearch(""); setOpen(true); };
-  const openEditModal = (p: Purchase) => { setEditingId(p.id); setItems([...p.items]); setSupplierId(p.supplierId); setSearch(""); setOpen(true); };
+  const openEditModal = (p: Purchase) => { setEditingId(p.id); setItems(p.items.map(i => ({ productId: i.productId, name: i.name, quantity: i.quantity, price: i.price, taxRate: i.taxRate ?? 0, priceMode: "ht" as const }))); setSupplierId(p.supplierId); setSearch(""); setOpen(true); };
   const closeModal = () => { setOpen(false); setEditingId(null); };
 
-  const addItem = (p: Product) => { setItems(it => [...it, { productId: p.id, name: p.name, quantity: 1, price: p.cost, total: p.cost }]); };
-  const updateItem = (idx: number, field: "quantity" | "price", value: number) => {
-    setItems(it => it.map((item, i) => { if (i !== idx) return item; const u = { ...item, [field]: value }; u.total = u.quantity * u.price; return u; }));
-  };
+  const addItem = (p: Product) => { setItems(it => [...it, { productId: p.id, name: p.name, quantity: 1, price: p.cost, taxRate: p.taxRate ?? ss.taxRate, priceMode: "ht" }]); };
+  const updateItem = (idx: number, patch: Partial<Line>) => setItems(it => it.map((item, i) => i === idx ? { ...item, ...patch } : item));
   const removeItem = (idx: number) => setItems(it => it.filter((_, i) => i !== idx));
 
-  const save = () => {
+  const save = async () => {
     if (!supplierId || items.length === 0) return push("Fournisseur et articles requis", "error");
     const supplier = suppliers.find(s => s.id === supplierId)!;
-    const tot = items.reduce((a, b) => a + b.total, 0);
+    if (items.some(i => !(i.quantity > 0))) return push("Chaque ligne doit avoir une quantité supérieure à 0", "error");
+    const tot = total;
+    const payloadItems = items.map(i => ({ productId: i.productId, name: i.name, quantity: i.quantity, price: i.price, taxRate: i.taxRate, priceMode: i.priceMode }));
     if (isEditing) {
-      const ok = requestOrExec({
+      const ok = await requestOrExec({
         kind: "purchase.update", module: "Achats", action: "Modifier un bon d'achat",
         description: `Modification du bon ${items.length} articles — ${fmtCurrency(tot)} chez ${supplier.name}`,
         details: { fournisseur: supplier.name, articles: String(items.length), total: fmtCurrency(tot) },
-        payload: { id: editingId!, data: { items, total: tot, supplierId: supplier.id, supplierName: supplier.name } },
+        payload: { id: editingId!, data: { items: payloadItems, supplierId: supplier.id } },
       });
-      push(ok ? "Bon d'achat modifié" : "Action en attente de validation");
+      if (ok === "error") return;
+    push(ok === "done" ? "Bon d'achat modifié" : "Action en attente de validation");
     } else {
-      const ok = requestOrExec({
+      const ok = await requestOrExec({
         kind: "purchase.add", module: "Achats", action: "Nouvel achat fournisseur",
         description: `Achat de ${items.length} articles chez ${supplier.name} — ${fmtCurrency(tot)}`,
         details: { fournisseur: supplier.name, articles: String(items.length), total: fmtCurrency(tot) },
-        payload: { items, supplierId: supplier.id, supplierName: supplier.name },
+        payload: { items: payloadItems, supplierId: supplier.id },
       });
-      push(ok ? "Achat enregistré et stocks mis à jour" : "Action en attente de validation");
+      if (ok === "error") return;
+    push(ok === "done" ? "Achat enregistré et stocks mis à jour" : "Action en attente de validation");
     }
     closeModal();
   };
@@ -58,13 +82,14 @@ export default function Purchases() {
   const handleDelete = async (p: Purchase) => {
     const ok = await confirm({ title: "Supprimer le bon d'achat", message: `Voulez-vous vraiment supprimer le bon « ${p.reference || p.id} » du fournisseur ${p.supplierName} ?`, confirmLabel: "Supprimer", variant: "danger" });
     if (!ok) return;
-    const ok2 = requestOrExec({
+    const ok2 = await requestOrExec({
       kind: "purchase.delete", module: "Achats", action: "Supprimer un bon d'achat",
       description: `Suppression du bon ${p.reference || p.id} — ${p.supplierName}`,
       details: { référence: p.reference || p.id, fournisseur: p.supplierName, total: fmtCurrency(p.total) },
       payload: { id: p.id },
     });
-    push(ok2 ? "Bon d'achat supprimé" : "Action en attente de validation");
+    if (ok2 === "error") return;
+    push(ok2 === "done" ? "Bon d'achat supprimé" : "Action en attente de validation");
   };
 
   const exportPDF = (purchase: Purchase) => {
@@ -143,8 +168,9 @@ export default function Purchases() {
 
     // ---- En-tête du tableau
     const colDesX = M + 3;
-    const colQteX = 118;
-    const colPuX = 150;
+    const colQteX = 100;
+    const colPuX = 128;
+    const colTvaX = 146;
     const colTotX = pageW - M - 3;
     doc.setFillColor(241, 245, 249);
     doc.rect(M, y - 5, pageW - 2 * M, 9, "F");
@@ -153,8 +179,9 @@ export default function Purchases() {
     doc.setTextColor(15, 23, 42);
     doc.text("Désignation", colDesX, y);
     doc.text("Qté", colQteX, y, { align: "right" });
-    doc.text(`PU (${cur})`, colPuX, y, { align: "right" });
-    doc.text(`Total (${cur})`, colTotX, y, { align: "right" });
+    doc.text(`PU HT`, colPuX, y, { align: "right" });
+    doc.text(`TVA`, colTvaX, y, { align: "right" });
+    doc.text(`Total TTC (${cur})`, colTotX, y, { align: "right" });
     y += 9;
 
     // ---- Lignes du tableau (zébrées)
@@ -170,8 +197,9 @@ export default function Purchases() {
       doc.text(it.name.length > 52 ? it.name.slice(0, 51) + "…" : it.name, colDesX, y);
       doc.text(String(it.quantity), colQteX, y, { align: "right" });
       doc.text(nf(it.price), colPuX, y, { align: "right" });
+      doc.text(`${it.taxRate ?? 0} %`, colTvaX, y, { align: "right" });
       doc.setFont("helvetica", "bold");
-      doc.text(nf(it.total), colTotX, y, { align: "right" });
+      doc.text(nf(it.totalTtc ?? it.total), colTotX, y, { align: "right" });
       doc.setFont("helvetica", "normal");
       y += 7;
     });
@@ -193,13 +221,24 @@ export default function Purchases() {
     doc.setTextColor(15, 23, 42);
     doc.text(String(purchase.items.length), totX + totW - 4, y + 4.7, { align: "right" });
     y += 7;
+    if (purchase.totalHt != null) {
+      doc.setFillColor(248, 250, 252);
+      doc.rect(totX, y, totW, 14, "F");
+      doc.setTextColor(71, 85, 105);
+      doc.text("Total HT", totX + 4, y + 4.7);
+      doc.text("TVA", totX + 4, y + 10.7);
+      doc.setTextColor(15, 23, 42);
+      doc.text(nf(purchase.totalHt) + " " + cur, totX + totW - 4, y + 4.7, { align: "right" });
+      doc.text(nf(purchase.totalTax ?? 0) + " " + cur, totX + totW - 4, y + 10.7, { align: "right" });
+      y += 14;
+    }
 
     doc.setFillColor(15, 23, 42);
     doc.roundedRect(totX, y, totW, 11, 1.5, 1.5, "F");
     doc.setTextColor(255, 255, 255);
     doc.setFont("helvetica", "bold");
     doc.setFontSize(9.5);
-    doc.text("TOTAL ACHAT", totX + 4, y + 7);
+    doc.text("TOTAL TTC", totX + 4, y + 7);
     doc.setFontSize(11);
     doc.text(nf(purchase.total) + " " + cur, totX + totW - 4, y + 7, { align: "right" });
     y += 16;
@@ -279,7 +318,7 @@ export default function Purchases() {
                 <th className="py-3 px-4">Fournisseur</th>
                 <th className="py-3 px-4 hidden lg:table-cell">Gestionnaire</th>
                 <th className="py-3 px-4 text-right hidden xl:table-cell">Articles</th>
-                <th className="py-3 px-4 text-right">Total</th>
+                <th className="py-3 px-4 text-right">Total TTC</th>
                 <th className="py-3 px-4 text-right">Actions</th>
               </tr>
             </thead>
@@ -291,7 +330,7 @@ export default function Purchases() {
                   <td className="py-3 px-4"><Badge>{p.supplierName}</Badge></td>
                   <td className="py-3 px-4 text-slate-600 hidden lg:table-cell">{p.managerName || "—"}</td>
                   <td className="py-3 px-4 text-right hidden xl:table-cell">{p.items.length}</td>
-                  <td className="py-3 px-4 text-right font-bold">{fmtCurrency(p.total)}</td>
+                  <td className="py-3 px-4 text-right font-bold">{fmtCurrency(p.total)}{p.totalHt != null && <div className="text-[10px] font-normal text-slate-400">HT {fmtCurrency(p.totalHt)} · TVA {fmtCurrency(p.totalTax ?? 0)}</div>}</td>
                   <td className="py-3 px-4 text-right whitespace-nowrap">
                     <button onClick={() => openEditModal(p)} className="p-2 rounded-lg hover:bg-slate-100 text-slate-600 inline-flex" title="Modifier"><IconEdit size={16} /></button>
                     <button onClick={() => exportPDF(p)} className="p-2 rounded-lg hover:bg-slate-100 text-slate-600 inline-flex" title="Télécharger PDF"><IconDownload size={16} /></button>
@@ -352,7 +391,10 @@ export default function Purchases() {
         size="lg"
         footer={
           <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
-            <div className="text-lg font-black text-slate-900">Total : {fmtCurrency(total)}</div>
+            <div className="text-slate-900">
+              <div className="text-lg font-black">Total TTC : {fmtCurrency(total)}</div>
+              <div className="text-xs text-slate-500">HT {fmtCurrency(r2(totals.ht))} · TVA {fmtCurrency(r2(totals.ttc - totals.ht))}</div>
+            </div>
             <div className="flex gap-2">
               <Button variant="ghost" onClick={closeModal} className="flex-1 sm:flex-none">Annuler</Button>
               <Button variant="success" onClick={save} className="flex-1 sm:flex-none">{isEditing ? "Enregistrer" : "Enregistrer l'achat"}</Button>
@@ -397,8 +439,9 @@ export default function Purchases() {
               <tr>
                 <th className="py-2 px-3 text-left">Produit</th>
                 <th className="py-2 px-3 text-right w-20">Qté</th>
-                <th className="py-2 px-3 text-right w-28">PU</th>
-                <th className="py-2 px-3 text-right w-28">Total</th>
+                <th className="py-2 px-3 text-right w-32">Prix unitaire</th>
+                <th className="py-2 px-3 text-right w-20">TVA %</th>
+                <th className="py-2 px-3 text-right w-28">Total TTC</th>
                 <th className="py-2 px-3 w-10"></th>
               </tr>
             </thead>
@@ -406,13 +449,17 @@ export default function Purchases() {
               {items.map((it, idx) => (
                 <tr key={idx} className="border-t border-slate-100">
                   <td className="py-2 px-3 max-w-[160px] truncate">{it.name}</td>
-                  <td className="py-2 px-3"><input type="number" className={inputClass + " !py-1 text-right"} value={it.quantity} onChange={e => updateItem(idx, "quantity", +e.target.value)} /></td>
-                  <td className="py-2 px-3"><input type="number" className={inputClass + " !py-1 text-right"} value={it.price} onChange={e => updateItem(idx, "price", +e.target.value)} /></td>
-                  <td className="py-2 px-3 text-right font-bold">{fmtCurrency(it.total)}</td>
+                  <td className="py-2 px-3"><input type="number" min="0" step="any" aria-label={`Quantité ${it.name}`} className={inputClass + " !py-1 text-right"} value={it.quantity} onChange={e => updateItem(idx, { quantity: +e.target.value })} /></td>
+                  <td className="py-2 px-3">
+                    <input type="number" min="0" step="any" aria-label={`Prix ${it.name}`} className={inputClass + " !py-1 text-right"} value={it.price} onChange={e => updateItem(idx, { price: +e.target.value })} />
+                    <PriceMode value={it.priceMode} onChange={m => updateItem(idx, { priceMode: m })} />
+                  </td>
+                  <td className="py-2 px-3 align-top"><input type="number" min="0" max="100" step="any" aria-label={`TVA ${it.name}`} className={inputClass + " !py-1 text-right"} value={it.taxRate} onChange={e => updateItem(idx, { taxRate: Math.min(100, Math.max(0, +e.target.value || 0)) })} /></td>
+                  <td className="py-2 px-3 text-right font-bold align-top pt-3">{fmtCurrency(calc(it).ttc)}<div className="text-[10px] font-normal text-slate-400">HT {fmtCurrency(calc(it).ht)}</div></td>
                   <td className="py-2 px-3"><button onClick={() => removeItem(idx)} className="p-1.5 text-rose-600 rounded hover:bg-rose-50"><IconTrash size={14} /></button></td>
                 </tr>
               ))}
-              {items.length === 0 && <tr><td colSpan={5} className="text-center text-slate-500 py-6">Aucun article ajouté</td></tr>}
+              {items.length === 0 && <tr><td colSpan={6} className="text-center text-slate-500 py-6">Aucun article ajouté</td></tr>}
             </tbody>
           </table>
         </div>
@@ -425,18 +472,22 @@ export default function Purchases() {
               <div className="flex items-start justify-between gap-2">
                 <div className="text-sm font-semibold text-slate-900 flex-1 min-w-0 leading-snug">{it.name}</div>
                 <div className="text-right flex-shrink-0">
-                  <div className="text-sm font-bold text-slate-900">{fmtCurrency(it.total)}</div>
+                  <div className="text-sm font-bold text-slate-900">{fmtCurrency(calc(it).ttc)}</div>
                   <button onClick={() => removeItem(idx)} className="text-rose-600 text-[11px] hover:underline">Retirer</button>
                 </div>
               </div>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-3 gap-2">
                 <Field label="Quantité">
-                  <input type="number" className={inputClass + " !py-1.5 text-center text-sm"} value={it.quantity} onChange={e => updateItem(idx, "quantity", +e.target.value)} />
+                  <input type="number" min="0" step="any" className={inputClass + " !py-1.5 text-center text-sm"} value={it.quantity} onChange={e => updateItem(idx, { quantity: +e.target.value })} />
                 </Field>
                 <Field label="Prix unitaire">
-                  <input type="number" className={inputClass + " !py-1.5 text-center text-sm"} value={it.price} onChange={e => updateItem(idx, "price", +e.target.value)} />
+                  <input type="number" min="0" step="any" className={inputClass + " !py-1.5 text-center text-sm"} value={it.price} onChange={e => updateItem(idx, { price: +e.target.value })} />
+                </Field>
+                <Field label="TVA %">
+                  <input type="number" min="0" max="100" step="any" className={inputClass + " !py-1.5 text-center text-sm"} value={it.taxRate} onChange={e => updateItem(idx, { taxRate: Math.min(100, Math.max(0, +e.target.value || 0)) })} />
                 </Field>
               </div>
+              <PriceMode value={it.priceMode} onChange={m => updateItem(idx, { priceMode: m })} />
             </div>
           ))}
         </div>

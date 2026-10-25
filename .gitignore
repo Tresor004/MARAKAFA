@@ -28,8 +28,15 @@ Desktop.ini
 .vscode/
 .idea/
 .cursor/
+.claude/
 
 # Fichiers temporaires
 
 *.tmp
 *.bak
+
+# Interface compilée copiée dans Laravel (régénérée par « npm run build:laravel »)
+/backend/public/app.html
+/backend/public/sw.js
+/backend/public/manifest.json
+/backend/public/icons/

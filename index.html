@@ -26,20 +26,5 @@
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
 
-    <!-- Enregistrement du Service Worker -->
-    <script>
-      if ('serviceWorker' in navigator) {
-        window.addEventListener('load', function () {
-          navigator.serviceWorker
-            .register('/sw.js', { scope: '/' })
-            .then(function (reg) {
-              console.log('[Hi-Market] Service Worker enregistré :', reg.scope);
-            })
-            .catch(function (err) {
-              console.warn('[Hi-Market] Service Worker non enregistré :', err);
-            });
-        });
-      }
-    </script>
   </body>
 </html>

@@ -5,40 +5,41 @@ import { IconPlus, IconTrash } from "../components/Icons";
 import { useToast, useConfirm } from "../components/ui";
 
 export default function Losses() {
-  const { losses, products, currentUser, requestOrExec } = useStore();
+  const { losses, products, currentUser, requestOrExec, isAdmin } = useStore();
   const { push } = useToast();
   const confirm = useConfirm();
-  const isAdmin = currentUser?.role === "admin";
   const [open, setOpen] = useState(false);
   const [productId, setProductId] = useState("");
   const [quantity, setQuantity] = useState(0);
   const [reason, setReason] = useState("Péremption");
 
-  const save = () => {
+  const save = async () => {
     const p = products.find(x => x.id === productId);
     if (!p || quantity <= 0) return push("Produit et quantité requis", "error");
     if (quantity > p.stock) return push("La quantité dépasse le stock disponible", "error");
     const lossData = { productId: p.id, productName: p.name, quantity, unitPrice: p.cost, total: quantity * p.cost, reason, date: new Date().toISOString().slice(0, 10), notedBy: currentUser?.name || "" };
-    const ok = requestOrExec({
+    const ok = await requestOrExec({
       kind: "loss.add", module: "Pertes", action: "Déclarer une perte",
       description: `${quantity} ${p.unit} de ${p.name} — motif : ${reason}`,
       details: { produit: p.name, quantité: String(quantity), motif: reason, valeur: fmtCurrency(quantity * p.cost) },
       payload: lossData,
     });
-    push(ok ? "Perte enregistrée · stock mis à jour" : "Action en attente de validation par l'administrateur");
+    if (ok === "error") return;
+    push(ok === "done" ? "Perte enregistrée · stock mis à jour" : "Action en attente de validation par l'administrateur");
     setOpen(false); setProductId(""); setQuantity(0);
   };
   const remove = async (id: string) => {
     const loss = losses.find(l => l.id === id);
     const ok = await confirm({ title: "Supprimer cette perte", message: "Voulez-vous vraiment supprimer cette entrée de perte ?", confirmLabel: "Supprimer", variant: "danger" });
     if (!ok) return;
-    const ok2 = requestOrExec({
+    const ok2 = await requestOrExec({
       kind: "loss.delete", module: "Pertes", action: "Supprimer une perte",
       description: `Suppression de ${loss?.productName || ""} (motif : ${loss?.reason || "?"})`,
       details: { produit: loss?.productName || "", motif: loss?.reason || "" },
       payload: { id },
     });
-    push(ok2 ? "Entrée supprimée" : "Action en attente de validation par l'administrateur");
+    if (ok2 === "error") return;
+    push(ok2 === "done" ? "Entrée supprimée" : "Action en attente de validation par l'administrateur");
   };
 
   const totalLoss = losses.reduce((a, b) => a + b.total, 0);

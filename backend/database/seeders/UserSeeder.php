@@ -2,51 +2,31 @@
 
 namespace Database\Seeders;
 
+use App\Models\Role;
+use App\Models\User;
 use Illuminate\Database\Seeder;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Hash;
 
+/**
+ * Comptes de démonstration. ⚠ À CHANGER AVANT TOUTE MISE EN PRODUCTION
+ * (ou supprimer les comptes de démo et ne garder que l'administrateur).
+ */
 class UserSeeder extends Seeder
 {
     public function run(): void
     {
-        $adminRoleId      = DB::table('roles')->where('name', 'Administrateur')->value('id');
-        $gestionnaireId   = DB::table('roles')->where('name', 'Gestionnaire')->value('id');
-        $caisierId        = DB::table('roles')->where('name', 'Caissier')->value('id');
+        $roles = Role::pluck('id', 'slug');
 
-        $now = now();
+        $users = [
+            ['Administrateur',  'admin@himarket.sn',     '77 000 00 01', 'admin123',     'admin'],
+            ['Ibrahima Mbaye',  'ibrahima@himarket.sn',  '76 987 65 43', 'ibrahima123',  'gestionnaire'],
+            ['Fatou Ka',        'fatou@himarket.sn',     '77 123 45 67', 'fatou123',     'caissier'],
+        ];
 
-        DB::table('users')->insert([
-            [
-                'name'       => 'Administrateur',
-                'email'      => 'admin@himarket.sn',
-                'phone'      => '77 000 00 01',
-                'password'   => Hash::make('admin123'),
-                'role_id'    => $adminRoleId,
-                'active'     => true,
-                'created_at' => $now,
-                'updated_at' => $now,
-            ],
-            [
-                'name'       => 'Fatou Ka',
-                'email'      => 'fatou@himarket.sn',
-                'phone'      => '77 123 45 67',
-                'password'   => Hash::make('fatou123'),
-                'role_id'    => $caisierId,
-                'active'     => true,
-                'created_at' => $now,
-                'updated_at' => $now,
-            ],
-            [
-                'name'       => 'Ibrahima Mbaye',
-                'email'      => 'ibrahima@himarket.sn',
-                'phone'      => '76 987 65 43',
-                'password'   => Hash::make('ibrahima123'),
-                'role_id'    => $gestionnaireId,
-                'active'     => true,
-                'created_at' => $now,
-                'updated_at' => $now,
-            ],
-        ]);
+        foreach ($users as [$name, $email, $phone, $password, $role]) {
+            User::updateOrCreate(['email' => $email], [
+                'name' => $name, 'phone' => $phone, 'password' => $password,
+                'role_id' => $roles[$role], 'active' => true,
+            ]);
+        }
     }
 }

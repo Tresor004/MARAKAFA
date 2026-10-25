@@ -2,117 +2,47 @@
 
 namespace App\Http\Controllers;
 
-use App\Http\Requests\ProductRequest;
-use App\Http\Resources\ProductResource;
+use App\Http\Support\Present;
 use App\Models\Product;
-use App\Services\NotificationService;
-use App\Services\PendingActionService;
 use Illuminate\Http\JsonResponse;
-use Illuminate\Http\Request;
-use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
 
+/**
+ * Lecture seule : toute création / modification / suppression passe par POST /api/actions
+ * (circuit de validation administrateur).
+ */
 class ProductController extends Controller
 {
-    public function __construct(
-        private readonly PendingActionService $pending,
-        private readonly NotificationService  $notif,
-    ) {}
-
-    public function index(Request $request): AnonymousResourceCollection
+    public function index(): JsonResponse
     {
-        $query = Product::with('category');
-
-        if ($request->filled('search')) {
-            $q = $request->search;
-            $query->where(fn($q2) => $q2->where('name', 'like', "%{$q}%")
-                                        ->orWhere('barcode', 'like', "%{$q}%"));
-        }
-
-        if ($request->filled('category_id')) {
-            $query->where('category_id', $request->category_id);
-        }
-
-        if ($request->filter === 'low') {
-            $query->whereRaw('stock <= min_stock')->where('stock', '>', 0);
-        } elseif ($request->filter === 'out') {
-            $query->where('stock', 0);
-        } elseif ($request->filter === 'expiring') {
-            $query->whereDate('expiry_date', '<=', now()->addDays(15));
-        }
-
-        return ProductResource::collection($query->orderBy('name')->get());
-    }
-
-    public function store(ProductRequest $request): JsonResponse
-    {
-        $user = $request->user();
-
-        if ($user->isAdmin()) {
-            $product = Product::create($request->validated());
-            $this->notif->notifyAll(
-                'Nouveau produit',
-                "Le produit « {$product->name} » a été ajouté au catalogue par {$user->name}.",
-                'info',
-                $user->id,
-                $user->name,
-            );
-            return response()->json(new ProductResource($product->load('category')), 201);
-        }
-
-        $pa = $this->pending->submit(
-            'product.add', 'Produits', 'Ajouter un produit',
-            "Ajout de « {$request->name} »",
-            ['produit' => $request->name, 'prix' => $request->price],
-            $request->validated(),
+        return response()->json(
+            Product::with('category')->orderBy('name')->get()->map(fn ($p) => Present::product($p))->values()
         );
-        return response()->json(['pending' => true, 'action_id' => $pa->id, 'message' => 'Demande soumise pour validation.'], 202);
     }
 
-    public function show(Product $product): ProductResource
+    /**
+     * GET /api/products/next-barcode — code EAN-13 à usage interne (préfixe 2), unique en base.
+     * Sert à étiqueter les produits sans code fabricant (vrac, fabrication maison).
+     */
+    public function nextBarcode(): JsonResponse
     {
-        return new ProductResource($product->load('category'));
-    }
+        for ($i = 0; $i < 20; $i++) {
+            $body = '2' . str_pad((string) random_int(0, 99999999999), 11, '0', STR_PAD_LEFT);
+            $sum = 0;
+            foreach (str_split($body) as $idx => $digit) {
+                $sum += (int) $digit * ($idx % 2 === 0 ? 1 : 3);
+            }
+            $code = $body . ((10 - $sum % 10) % 10);
 
-    public function update(ProductRequest $request, Product $product): JsonResponse
-    {
-        $user = $request->user();
-
-        if ($user->isAdmin()) {
-            $product->update($request->validated());
-            return response()->json(new ProductResource($product->fresh('category')));
+            if (! Product::withTrashed()->where('barcode', $code)->exists()) {
+                return response()->json(['barcode' => $code]);
+            }
         }
 
-        $pa = $this->pending->submit(
-            'product.update', 'Produits', 'Modifier un produit',
-            "Modification de « {$product->name} »",
-            ['produit' => $product->name],
-            ['id' => $product->id, 'data' => $request->validated()],
-        );
-        return response()->json(['pending' => true, 'action_id' => $pa->id], 202);
+        abort(503, 'Impossible de générer un code-barres unique, réessayez.');
     }
 
-    public function destroy(Request $request, Product $product): JsonResponse
+    public function show(Product $product): JsonResponse
     {
-        $user = $request->user();
-
-        if ($user->isAdmin()) {
-            $product->delete();
-            $this->notif->notifyAll(
-                'Produit supprimé',
-                "Le produit « {$product->name} » a été supprimé du catalogue par {$user->name}.",
-                'info',
-                $user->id,
-                $user->name,
-            );
-            return response()->json(['message' => 'Produit supprimé.']);
-        }
-
-        $pa = $this->pending->submit(
-            'product.delete', 'Produits', 'Supprimer un produit',
-            "Suppression de « {$product->name} »",
-            ['produit' => $product->name],
-            ['id' => $product->id],
-        );
-        return response()->json(['pending' => true, 'action_id' => $pa->id], 202);
+        return response()->json(Present::product($product->load('category')));
     }
 }

@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { useStore } from "../store";
 import { IconEye, IconEyeOff } from "../components/Icons";
+import { LOCAL_MODE } from "../api";
 
 type Screen = "login" | "forgot";
 
 export default function Login() {
-  const { login, users, shopSettings: ss, notifyAll } = useStore();
+  const { login, forgotPassword, shopSettings: ss } = useStore();
   const [screen, setScreen] = useState<Screen>("login");
 
   // ── Login state ──
@@ -22,7 +23,7 @@ export default function Login() {
   const [forgotLoading, setForgotLoading] = useState(false);
 
   // ── Login : accept email, phone, or name ──
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoginError("");
     if (!identifier.trim() || !password) {
@@ -30,44 +31,23 @@ export default function Login() {
       return;
     }
     setLoading(true);
-    setTimeout(() => {
-      const result = login(identifier.trim(), password);
-      if (!result.ok) setLoginError(result.error || "Erreur de connexion.");
-      setLoading(false);
-    }, 350);
+    const result = await login(identifier.trim(), password);
+    if (!result.ok) setLoginError(result.error || "Erreur de connexion.");
+    setLoading(false);
   };
 
   // ── Forgot password ──
-  const handleForgot = (e: React.FormEvent) => {
+  const handleForgot = async (e: React.FormEvent) => {
     e.preventDefault();
     setForgotError("");
     if (!forgotId.trim()) { setForgotError("Veuillez saisir votre email ou téléphone."); return; }
 
     setForgotLoading(true);
-    setTimeout(() => {
-      const q = forgotId.trim().toLowerCase();
-      const found = users.find(u =>
-        u.email.toLowerCase() === q ||
-        (u.phone || "").replace(/\s/g, "") === q.replace(/\s/g, "")
-      );
-
-      if (!found) {
-        setForgotError("Aucun compte trouvé avec cet email ou ce numéro de téléphone.");
-        setForgotLoading(false);
-        return;
-      }
-
-      // Notify all admins (general channel "*" since we target admins by role in store)
-      notifyAll(
-        "Demande de réinitialisation de mot de passe",
-        `L'employé « ${found.name} » (${found.email}${found.phone ? " · " + found.phone : ""}) a oublié son mot de passe et demande de l'aide pour se connecter. Veuillez contacter cet employé pour l'assister.`,
-        "warning",
-        found.id,
-        found.name,
-      );
-      setForgotSuccess(true);
-      setForgotLoading(false);
-    }, 400);
+    // Le serveur prévient les administrateurs ; la réponse est identique que le compte existe ou non.
+    const r = await forgotPassword(forgotId.trim());
+    if (r.ok) setForgotSuccess(true);
+    else setForgotError(r.message);
+    setForgotLoading(false);
   };
 
   const brandLogo = ss.logo ? (
@@ -162,6 +142,13 @@ export default function Login() {
             <div className="mt-5 pt-5 border-t border-slate-100 text-center">
               <p className="text-xs text-slate-400">Contactez l'administrateur si vous n'avez pas de compte.</p>
             </div>
+
+            {LOCAL_MODE && (
+              <div className="mt-4 rounded-xl bg-amber-50 border border-amber-200 px-3 py-2.5 text-[11px] text-amber-900 leading-relaxed">
+                <b>Version sans serveur :</b> les données sont enregistrées dans ce navigateur uniquement.
+                Premier lancement : <b>admin@himarket.sn</b> / <b>admin123</b> (changez ce mot de passe dans « Mon espace »).
+              </div>
+            )}
           </div>
         )}
 

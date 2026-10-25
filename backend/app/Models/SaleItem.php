@@ -9,13 +9,21 @@ class SaleItem extends Model
 {
     protected $fillable = [
         'sale_id', 'product_id', 'product_name',
-        'quantity', 'unit_price', 'total',
+        'quantity', 'unit_price', 'unit_cost', 'total',
+        'tax_rate', 'tax_amount', 'discount_percent', 'discount_amount', 'promotion_id', 'promotion_label',
+        'returned_quantity',
     ];
 
     protected $casts = [
         'quantity'   => 'float',
         'unit_price' => 'float',
+        'unit_cost'  => 'float',
         'total'      => 'float',
+        'tax_rate'          => 'float',
+        'tax_amount'        => 'float',
+        'discount_percent'  => 'float',
+        'discount_amount'   => 'float',
+        'returned_quantity' => 'float',
     ];
 
     public function sale(): BelongsTo

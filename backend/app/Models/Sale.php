@@ -13,13 +13,19 @@ class Sale extends Model
 
     protected $fillable = [
         'invoice_no', 'customer_id', 'user_id',
-        'total', 'paid', 'change_due', 'payment_method', 'sale_date',
+        'total', 'tax_rate', 'tax_amount', 'paid', 'change_due', 'payment_method', 'sale_date',
+        'amount_paid', 'balance_due', 'returned_total', 'cash_session_id',
     ];
 
     protected $casts = [
         'total'      => 'float',
+        'tax_rate'   => 'float',
+        'tax_amount' => 'float',
         'paid'       => 'float',
         'change_due' => 'float',
+        'amount_paid'    => 'float',
+        'balance_due'    => 'float',
+        'returned_total' => 'float',
         'sale_date'  => 'date',
     ];
 
@@ -36,5 +42,15 @@ class Sale extends Model
     public function items(): HasMany
     {
         return $this->hasMany(SaleItem::class);
+    }
+
+    public function payments(): HasMany
+    {
+        return $this->hasMany(Payment::class);
+    }
+
+    public function returns(): HasMany
+    {
+        return $this->hasMany(SaleReturn::class);
     }
 }

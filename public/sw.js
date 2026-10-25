@@ -1,79 +1,50 @@
 /* ============================================================
    Hi-Market Service Worker
-   Stratégie : Cache-First pour les assets statiques,
-               Network-First pour les requêtes dynamiques.
+   - Interface (HTML/JS/CSS/images) : réseau d'abord, cache en secours hors-ligne.
+   - API (/api/…) : JAMAIS mise en cache (stocks, ventes, droits : toujours frais et propres à l'utilisateur).
    ============================================================ */
 
-const CACHE_NAME = 'himarket-v1';
+const CACHE_NAME = 'himarket-v2';
+const SCOPE = self.registration.scope; // ex. https://boutique.com/  ou  https://user.github.io/MARAKAFA/
 
-// Assets à mettre en cache immédiatement lors de l'installation
-const PRECACHE_ASSETS = [
-  '/',
-  '/manifest.json',
-  '/icons/icon-192.png',
-  '/icons/icon-512.png',
-];
+const PRECACHE_ASSETS = [SCOPE, SCOPE + 'manifest.json', SCOPE + 'icons/icon-192.png', SCOPE + 'icons/icon-512.png'];
 
-// ── Installation : précache les assets essentiels ─────────────
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => {
-      return cache.addAll(PRECACHE_ASSETS);
-    }).then(() => self.skipWaiting())
+    caches.open(CACHE_NAME)
+      .then((cache) => cache.addAll(PRECACHE_ASSETS).catch(() => undefined))
+      .then(() => self.skipWaiting())
   );
 });
 
-// ── Activation : supprime les anciens caches ──────────────────
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(
-        keys
-          .filter((key) => key !== CACHE_NAME)
-          .map((key) => caches.delete(key))
-      )
-    ).then(() => self.clients.claim())
+    caches.keys()
+      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))))
+      .then(() => self.clients.claim())
   );
 });
 
-// ── Fetch : stratégie hybride ─────────────────────────────────
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = new URL(request.url);
 
-  // On ne gère que les requêtes GET de même origine
-  if (request.method !== 'GET' || url.origin !== location.origin) {
+  // Uniquement les GET de même origine, et jamais l'API
+  if (request.method !== 'GET' || url.origin !== location.origin || url.pathname.includes('/api/')) {
     return;
   }
 
-  // Navigation (HTML) : Network-First avec fallback sur cache
-  if (request.mode === 'navigate') {
-    event.respondWith(
-      fetch(request)
-        .then((response) => {
+  event.respondWith(
+    fetch(request)
+      .then((response) => {
+        if (response && response.status === 200 && response.type === 'basic') {
           const clone = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
-          return response;
-        })
-        .catch(() => caches.match(request).then((cached) => cached || caches.match('/')))
-    );
-    return;
-  }
-
-  // Assets statiques (JS, CSS, images) : Cache-First
-  event.respondWith(
-    caches.match(request).then((cached) => {
-      if (cached) return cached;
-
-      return fetch(request).then((response) => {
-        // Ne cache que les réponses valides
-        if (!response || response.status !== 200 || response.type === 'opaque') {
-          return response;
         }
-        const clone = response.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
         return response;
-      });
-    })
+      })
+      .catch(() =>
+        caches.match(request).then((cached) => cached || (request.mode === 'navigate' ? caches.match(SCOPE) : undefined))
+      )
   );
 });

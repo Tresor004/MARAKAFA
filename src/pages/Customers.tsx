@@ -1,12 +1,21 @@
 import { useState } from "react";
 import { useStore, fmtCurrency } from "../store";
 import { Customer } from "../types";
+import SettleModal from "../components/SettleModal";
 import { Card, Button, Modal, Field, inputClass, Badge, EmptyState } from "../components/ui";
 import { IconPlus, IconEdit, IconTrash, IconSearch, IconClose } from "../components/Icons";
 import { useToast, useConfirm } from "../components/ui";
 
+/** Champs modifiables d'une fiche client (le solde et le cumul sont calculés par le serveur). */
+const customerData = (f: Partial<Customer>) => ({
+  name: f.name, phone: f.phone, email: f.email, address: f.address,
+  creditLimit: f.creditLimit === undefined || f.creditLimit === null || (f.creditLimit as unknown) === "" ? null : Number(f.creditLimit),
+});
+
 export default function Customers() {
-  const { customers, requestOrExec } = useStore();
+  const { customers, requestOrExec, shopSettings, canAccess } = useStore();
+  const [onlyDebtors, setOnlyDebtors] = useState(false);
+  const [settleFor, setSettleFor] = useState<Customer | null>(null);
   const { push } = useToast();
   const confirm = useConfirm();
   const [open, setOpen] = useState(false);
@@ -15,23 +24,28 @@ export default function Customers() {
   const [search, setSearch] = useState("");
 
   const q = search.toLowerCase().trim();
+  const totalDue = customers.reduce((a, c) => a + (c.balance ?? 0), 0);
+  const debtors = customers.filter(c => (c.balance ?? 0) > 0.004).length;
   const filtered = customers.filter(c =>
+    (!onlyDebtors || (c.balance ?? 0) > 0.004) && (
     !q ||
     c.name.toLowerCase().includes(q) ||
     (c.phone || "").toLowerCase().includes(q) ||
     (c.address || "").toLowerCase().includes(q)
-  );
+  ));
 
   const openAdd = () => { setEditing(null); setForm({}); setOpen(true); };
   const openEdit = (c: Customer) => { setEditing(c); setForm({ ...c }); setOpen(true); };
-  const save = () => {
+  const save = async () => {
     if (!form.name) return push("Le nom est requis", "error");
     if (editing) {
-      const ok = requestOrExec({ kind: "customer.update", module: "Clients", action: "Modifier un client", description: `Modification de « ${form.name} »`, details: { nom: form.name || "" }, payload: { id: editing.id, data: form } });
-      push(ok ? "Client modifié" : "Action en attente de validation");
+      const ok = await requestOrExec({ kind: "customer.update", module: "Clients", action: "Modifier un client", description: `Modification de « ${form.name} »`, details: { nom: form.name || "" }, payload: { id: editing.id, data: customerData(form) } });
+      if (ok === "error") return;
+    push(ok === "done" ? "Client modifié" : "Action en attente de validation");
     } else {
-      const ok = requestOrExec({ kind: "customer.add", module: "Clients", action: "Ajouter un client", description: `Nouveau client « ${form.name} »`, details: { nom: form.name || "", téléphone: form.phone || "" }, payload: form });
-      push(ok ? "Client ajouté" : "Action en attente de validation");
+      const ok = await requestOrExec({ kind: "customer.add", module: "Clients", action: "Ajouter un client", description: `Nouveau client « ${form.name} »`, details: { nom: form.name || "", téléphone: form.phone || "" }, payload: customerData(form) });
+      if (ok === "error") return;
+    push(ok === "done" ? "Client ajouté" : "Action en attente de validation");
     }
     setOpen(false);
   };
@@ -43,8 +57,9 @@ export default function Customers() {
       variant: "danger",
     });
     if (!ok) return;
-    const ok2 = requestOrExec({ kind: "customer.delete", module: "Clients", action: "Supprimer un client", description: `Suppression de « ${c.name} »`, details: { nom: c.name }, payload: { id: c.id } });
-    push(ok2 ? "Client supprimé" : "Action en attente de validation");
+    const ok2 = await requestOrExec({ kind: "customer.delete", module: "Clients", action: "Supprimer un client", description: `Suppression de « ${c.name} »`, details: { nom: c.name }, payload: { id: c.id } });
+    if (ok2 === "error") return;
+    push(ok2 === "done" ? "Client supprimé" : "Action en attente de validation");
   };
 
   return (
@@ -52,7 +67,8 @@ export default function Customers() {
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div className="min-w-0">
           <h1 className="text-xl sm:text-2xl lg:text-3xl font-black text-slate-900">Gestion des clients</h1>
-          <p className="text-slate-500 text-xs sm:text-sm mt-1">{customers.length} client{customers.length > 1 ? "s" : ""} · Cumul : <b>{fmtCurrency(customers.reduce((a, b) => a + b.totalPurchases, 0))}</b></p>
+          <p className="text-slate-500 text-xs sm:text-sm mt-1">{customers.length} client{customers.length > 1 ? "s" : ""} · Cumul : <b>{fmtCurrency(customers.reduce((a, b) => a + b.totalPurchases, 0))}</b>
+            {totalDue > 0.004 && <> · Créances : <b className="text-rose-600">{fmtCurrency(totalDue)}</b> ({debtors} débiteur{debtors > 1 ? "s" : ""})</>}</p>
         </div>
         <Button onClick={openAdd} className="w-full sm:w-auto"><IconPlus size={16} /> Nouveau client</Button>
       </div>
@@ -73,6 +89,7 @@ export default function Customers() {
             </button>
           )}
         </div>
+        <label className="flex items-center gap-2 text-xs text-slate-600 mt-3"><input type="checkbox" checked={onlyDebtors} onChange={e => setOnlyDebtors(e.target.checked)} /> Afficher uniquement les clients qui nous doivent de l'argent</label>
         {q && (
           <p className="text-xs text-slate-500 mt-2">{filtered.length} résultat{filtered.length > 1 ? "s" : ""} pour « {search} »</p>
         )}
@@ -88,6 +105,7 @@ export default function Customers() {
                 <th className="py-3 px-4">Téléphone</th>
                 <th className="py-3 px-4 hidden lg:table-cell">Adresse</th>
                 <th className="py-3 px-4 text-right">Achats cumulés</th>
+                <th className="py-3 px-4 text-right">Solde dû</th>
                 <th className="py-3 px-4 text-right">Actions</th>
               </tr>
             </thead>
@@ -98,7 +116,12 @@ export default function Customers() {
                   <td className="py-3 px-4 text-slate-600">{c.phone}</td>
                   <td className="py-3 px-4 text-slate-600 hidden lg:table-cell">{c.address}</td>
                   <td className="py-3 px-4 text-right"><Badge tone="emerald">{fmtCurrency(c.totalPurchases)}</Badge></td>
+                  <td className="py-3 px-4 text-right">
+                    {(c.balance ?? 0) > 0.004 ? <Badge tone="rose">{fmtCurrency(c.balance ?? 0)}</Badge> : <span className="text-slate-400">—</span>}
+                    {c.creditLimit != null && <div className="text-[10px] text-slate-400">plafond {fmtCurrency(c.creditLimit)}</div>}
+                  </td>
                   <td className="py-3 px-4 text-right whitespace-nowrap">
+                    {(c.balance ?? 0) > 0.004 && canAccess("sales") && <button onClick={() => setSettleFor(c)} className="px-2.5 py-1.5 mr-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-xs font-semibold">Encaisser</button>}
                     <button onClick={() => openEdit(c)} className="p-2 rounded-lg hover:bg-slate-100 inline-flex"><IconEdit size={16} /></button>
                     <button onClick={() => remove(c)} className="p-2 rounded-lg hover:bg-rose-50 text-rose-600 inline-flex"><IconTrash size={16} /></button>
                   </td>
@@ -121,9 +144,13 @@ export default function Customers() {
                 {c.phone && <div className="text-xs text-slate-500 mt-0.5">{c.phone}</div>}
                 {c.address && <div className="text-xs text-slate-500">{c.address}</div>}
               </div>
-              <Badge tone="emerald">{fmtCurrency(c.totalPurchases)}</Badge>
+              <div className="text-right flex-shrink-0 space-y-1">
+                <Badge tone="emerald">{fmtCurrency(c.totalPurchases)}</Badge>
+                {(c.balance ?? 0) > 0.004 && <div><Badge tone="rose">Doit {fmtCurrency(c.balance ?? 0)}</Badge></div>}
+              </div>
             </div>
             <div className="flex gap-2 pt-3 mt-3 border-t border-slate-100">
+              {(c.balance ?? 0) > 0.004 && canAccess("sales") && <button onClick={() => setSettleFor(c)} className="flex-1 flex items-center justify-center py-2 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-xs font-semibold">Encaisser</button>}
               <button onClick={() => openEdit(c)} className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold transition active:scale-[.97]"><IconEdit size={14} /> Modifier</button>
               <button onClick={() => remove(c)} className="flex items-center justify-center p-2 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 transition active:scale-[.97]"><IconTrash size={14} /></button>
             </div>
@@ -136,12 +163,16 @@ export default function Customers() {
           <Field label="Nom complet"><input className={inputClass} value={form.name || ""} onChange={e => setForm({ ...form, name: e.target.value })} /></Field>
           <Field label="Téléphone"><input className={inputClass} value={form.phone || ""} onChange={e => setForm({ ...form, phone: e.target.value })} /></Field>
           <Field label="Adresse"><input className={inputClass} value={form.address || ""} onChange={e => setForm({ ...form, address: e.target.value })} /></Field>
+          <Field label="Plafond de crédit" hint={shopSettings.allowCredit ? "Vide = illimité. Montant maximal que le client peut devoir." : "Le crédit est désactivé dans les paramètres."}>
+            <input type="number" min="0" step="any" className={inputClass} placeholder="Illimité" value={form.creditLimit ?? ""} onChange={e => setForm({ ...form, creditLimit: e.target.value === "" ? null : +e.target.value })} />
+          </Field>
         </div>
         <div className="flex justify-end gap-2 mt-6">
           <Button variant="ghost" onClick={() => setOpen(false)}>Annuler</Button>
           <Button onClick={save}>{editing ? "Enregistrer" : "Créer le client"}</Button>
         </div>
       </Modal>
+      {settleFor && <SettleModal customer={customers.find(c => c.id === settleFor.id) ?? settleFor} onClose={() => setSettleFor(null)} />}
     </div>
   );
 }

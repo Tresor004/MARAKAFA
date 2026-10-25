@@ -25,9 +25,9 @@ return new class extends Migration
             $table->foreignId('inventory_session_id')->constrained()->cascadeOnDelete();
             $table->foreignId('product_id')->nullable()->constrained()->nullOnDelete();
             $table->string('product_name');
-            $table->integer('expected');
-            $table->integer('actual');
-            $table->integer('difference')->storedAs('actual - expected');
+            $table->decimal('expected', 12, 3);
+            $table->decimal('actual', 12, 3);
+            $table->decimal('difference', 12, 3)->storedAs('actual - expected');
             $table->timestamps();
 
             $table->index('inventory_session_id');

@@ -11,6 +11,7 @@ return new class extends Migration
         Schema::create('roles', function (Blueprint $table) {
             $table->id();
             $table->string('name');
+            $table->string('slug', 60)->nullable()->unique();   // identifiant stable : admin, gestionnaire, caissier, ...
             $table->text('description')->nullable();
             $table->boolean('is_system')->default(false);   // rôles système non supprimables
             $table->timestamps();

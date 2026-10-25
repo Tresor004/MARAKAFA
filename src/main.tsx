@@ -11,3 +11,13 @@ createRoot(document.getElementById("root")!).render(
     <App />
   </StrictMode>
 );
+
+// Service worker (installation sur l'écran d'accueil + secours hors-ligne de l'interface).
+// Désactivé en développement pour ne pas masquer les modifications ; ne met jamais l'API en cache.
+if (import.meta.env.PROD && "serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker
+      .register(`${import.meta.env.BASE_URL}sw.js`, { scope: import.meta.env.BASE_URL })
+      .catch((err) => console.warn("[Hi-Market] Service Worker non enregistré :", err));
+  });
+}

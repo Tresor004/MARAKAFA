@@ -9,13 +9,16 @@ class PurchaseItem extends Model
 {
     protected $fillable = [
         'purchase_id', 'product_id', 'product_name',
-        'quantity', 'unit_price', 'total',
+        'quantity', 'unit_price', 'total', 'tax_rate', 'unit_price_ttc', 'total_ttc',
     ];
 
     protected $casts = [
         'quantity'   => 'float',
         'unit_price' => 'float',
         'total'      => 'float',
+        'tax_rate'       => 'float',
+        'unit_price_ttc' => 'float',
+        'total_ttc'      => 'float',
     ];
 
     public function purchase(): BelongsTo

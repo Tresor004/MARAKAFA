@@ -2,87 +2,120 @@
 
 namespace App\Http\Controllers;
 
-use App\Http\Resources\UserResource;
+use App\Http\Support\Present;
 use App\Models\User;
+use App\Services\NotificationService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Validation\ValidationException;
 
 class AuthController extends Controller
 {
     /**
-     * POST /api/login
-     * Retourne un token Sanctum + l'utilisateur avec son rôle et ses permissions.
+     * POST /api/login — identifiant = email, nom complet ou numéro de téléphone.
      */
-    public function login(Request $request): JsonResponse
+    public function login(Request $request, NotificationService $notif): JsonResponse
     {
-        $request->validate([
-            'email'    => ['required', 'email'],
-            'password' => ['required', 'string'],
+        $data = $request->validate([
+            'identifier' => ['required', 'string', 'max:255'],
+            'password'   => ['required', 'string', 'max:255'],
         ]);
 
-        // Tentative de connexion
-        $user = User::with('role.permissions')
-            ->where('email', $request->email)
-            ->first();
+        $user = $this->findByIdentifier($data['identifier']);
 
-        if (! $user || ! Hash::check($request->password, $user->password)) {
+        // Même message pour « inconnu » et « mauvais mot de passe » : on ne révèle pas quels comptes existent.
+        if (! $user || ! Hash::check($data['password'], $user->password)) {
             throw ValidationException::withMessages([
-                'email' => ['Email ou mot de passe incorrect.'],
+                'identifier' => ['Identifiant ou mot de passe incorrect.'],
             ]);
         }
 
         if (! $user->active) {
             throw ValidationException::withMessages([
-                'email' => ['Ce compte est désactivé. Contactez l\'administrateur.'],
+                'identifier' => ['Ce compte est désactivé. Contactez l\'administrateur.'],
             ]);
         }
 
-        // Supprimer les anciens tokens (mono-session)
-        $user->tokens()->delete();
+        $token = $user->createToken('web', ['*'], now()->addHours(12));
+        $user->forceFill(['last_seen_at' => now()])->saveQuietly();
 
-        // Créer un nouveau token avec expiration de 8h
-        $token = $user->createToken('api-token', ['*'], now()->addHours(8));
-
-        // Mettre à jour la présence en ligne
-        $user->update(['last_seen_at' => now()]);
+        // Contrôles quotidiens (stock critique, produits périmés) : au plus une fois par jour
+        $notif->runDailyChecksOncePerDay();
 
         return response()->json([
             'token' => $token->plainTextToken,
-            'user'  => new UserResource($user),
+            'user'  => Present::user($user->load('role.permissions')),
+            'role'  => Present::role($user->role),
         ]);
     }
 
-    /**
-     * POST /api/logout
-     */
     public function logout(Request $request): JsonResponse
     {
-        $request->user()->currentAccessToken()->delete();
-        return response()->json(['message' => 'Déconnecté avec succès.']);
+        $request->user()->currentAccessToken()?->delete();
+
+        return response()->json(['message' => 'Déconnecté.']);
     }
 
-    /**
-     * GET /api/me
-     * Retourne l'utilisateur connecté avec rôle + permissions.
-     */
+    /** GET /api/me — utilisateur courant et son rôle (permissions à jour). */
     public function me(Request $request): JsonResponse
     {
-        // Met à jour la présence en ligne
-        $request->user()->update(['last_seen_at' => now()]);
+        $user = $request->user()->load('role.permissions');
 
-        return response()->json(new UserResource($request->user()->load('role.permissions')));
+        return response()->json([
+            'user' => Present::user($user),
+            'role' => Present::role($user->role),
+        ]);
+    }
+
+    /** POST /api/me/verify-password — confirme l'identité avant une opération sensible (changement de profil). */
+    public function verifyPassword(Request $request): JsonResponse
+    {
+        $data = $request->validate(['password' => ['required', 'string', 'max:255']]);
+
+        if (! Hash::check($data['password'], $request->user()->password)) {
+            throw ValidationException::withMessages(['password' => ['Mot de passe incorrect.']]);
+        }
+
+        return response()->json(['ok' => true]);
     }
 
     /**
-     * PUT /api/me/ping
-     * Mise à jour de la présence en ligne (appelé toutes les 30s).
+     * POST /api/forgot-password — prévient les administrateurs ; réponse identique que le compte existe ou non.
      */
-    public function ping(Request $request): JsonResponse
+    public function forgotPassword(Request $request, NotificationService $notif): JsonResponse
     {
-        $request->user()->update(['last_seen_at' => now()]);
-        return response()->json(['online' => true]);
+        $data = $request->validate(['identifier' => ['required', 'string', 'max:255']]);
+
+        $user = $this->findByIdentifier($data['identifier']);
+        if ($user && $user->active) {
+            $notif->notifyAdmins(
+                'Réinitialisation de mot de passe demandée',
+                "{$user->name} ({$user->email}) a oublié son mot de passe. Modifiez-le dans la page Employés.",
+                'warning', $user->id, $user->name, 'users',
+            );
+        }
+
+        return response()->json([
+            'message' => 'Si ce compte existe, l\'administrateur a été prévenu et vous communiquera un nouveau mot de passe.',
+        ]);
+    }
+
+    private function findByIdentifier(string $identifier): ?User
+    {
+        $q = mb_strtolower(trim($identifier));
+        $digits = User::normalizePhone($identifier);
+
+        $user = User::with('role.permissions')
+            ->where(fn ($w) => $w->whereRaw('LOWER(email) = ?', [$q])->orWhereRaw('LOWER(name) = ?', [$q]))
+            ->first();
+
+        // Téléphone : comparaison sur les chiffres uniquement (espaces, +, tirets ignorés)
+        if (! $user && strlen($digits) >= 6) {
+            $user = User::with('role.permissions')->whereNotNull('phone')->get()
+                ->first(fn (User $u) => User::normalizePhone($u->phone) === $digits);
+        }
+
+        return $user;
     }
 }

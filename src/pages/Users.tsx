@@ -16,7 +16,7 @@ export default function UsersPage() {
   // ----- User modal state
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<User | null>(null);
-  const defaultRoleId = roles.find(r => r.id === "caissier")?.id || roles[0]?.id || "";
+  const defaultRoleId = roles.find(r => r.slug === "caissier")?.id || roles[0]?.id || "";
   const [form, setForm] = useState<Partial<User>>({ role: defaultRoleId, active: true });
   const [showPwd, setShowPwd] = useState(true);
 
@@ -71,7 +71,18 @@ export default function UsersPage() {
         avatarAvant = editing.avatar ? await makeAvatarPreview(editing.avatar) : "";
       }
 
-      const ok = requestOrExec({
+      // N'envoie que ce qui change (la photo, lourde, n'est renvoyée que si elle a été modifiée)
+      const changedData: Record<string, unknown> = {};
+      if (form.name !== editing.name) changedData.name = form.name;
+      if (form.email !== editing.email) changedData.email = form.email;
+      if ((form.phone || "") !== (editing.phone || "")) changedData.phone = form.phone || "";
+      if (form.role !== editing.role) changedData.role = form.role;
+      if (form.active !== editing.active) changedData.active = !!form.active;
+      if (form.password) changedData.password = form.password;
+      if (avatarChanged) changedData.avatar = form.avatar ?? "";
+      if (Object.keys(changedData).length === 0) { setOpen(false); return push("Aucune modification", "info"); }
+
+      const ok = await requestOrExec({
         kind: "user.update", module: "Employés", action: "Modifier un employé",
         description: `Modification de « ${form.name} » — rôle : ${roleLabel}`,
         details: {
@@ -79,11 +90,12 @@ export default function UsersPage() {
           changes,
           ...(avatarChanged ? { avatar_avant: avatarAvant ?? "" } : {}),
         },
-        payload: { id: editing.id, data: form },
+        payload: { id: editing.id, data: changedData },
       });
-      push(ok ? "Employé modifié" : "Action en attente de validation");
+      if (ok === "error") return;
+    push(ok === "done" ? "Employé modifié" : "Action en attente de validation");
     } else {
-      const ok = requestOrExec({
+      const ok = await requestOrExec({
         kind: "user.add", module: "Employés", action: "Ajouter un employé",
         description: `Nouvel employé « ${form.name} » — rôle : ${roleLabel}`,
         details: {
@@ -94,7 +106,8 @@ export default function UsersPage() {
         },
         payload: form,
       });
-      push(ok ? "Employé ajouté" : "Action en attente de validation");
+      if (ok === "error") return;
+    push(ok === "done" ? "Employé ajouté" : "Action en attente de validation");
     }
     setOpen(false);
   };
@@ -106,12 +119,13 @@ export default function UsersPage() {
       variant: "danger",
     });
     if (!ok) return;
-    const ok2 = requestOrExec({
+    const ok2 = await requestOrExec({
       kind: "user.delete", module: "Employés", action: "Supprimer un employé",
       description: `Suppression de « ${u.name} »`, details: { nom: u.name },
       payload: { id: u.id },
     });
-    push(ok2 ? "Employé supprimé" : "Action en attente de validation");
+    if (ok2 === "error") return;
+    push(ok2 === "done" ? "Employé supprimé" : "Action en attente de validation");
   };
 
   const generatePwd = () => {
@@ -146,8 +160,8 @@ export default function UsersPage() {
   };
 
   const roleTone = (roleId: string): Tone => {
-    if (roleId === "admin") return "rose";
     const r = roles.find(x => x.id === roleId);
+    if (r?.slug === "admin") return "rose";
     if (r?.isSystem) return "sky";
     return "amber";
   };
@@ -187,15 +201,17 @@ export default function UsersPage() {
   const selectAllPerms = () => setFPerms(NAV_ITEMS.map(n => n.key));
   const clearAllPerms = () => setFPerms([]);
 
-  const saveRole = () => {
+  const saveRole = async () => {
     const name = fName.trim();
     if (!name) return push("Le nom du rôle est requis", "error");
     if (fPerms.length === 0) return push("Sélectionnez au moins une page d'accès", "error");
     if (selectedId) {
-      updateRole(selectedId, { name, description: fDesc.trim(), permissions: fPerms });
+      if (roles.find(r => r.id === selectedId)?.slug === "admin") return push("Le rôle Administrateur ne peut pas être modifié", "error");
+      if (!(await updateRole(selectedId, { name, description: fDesc.trim(), permissions: fPerms }))) return;
       push(`Rôle « ${name} » mis à jour`);
     } else {
-      const created = addRole({ name, description: fDesc.trim(), permissions: fPerms, isSystem: false });
+      const created = await addRole({ name, description: fDesc.trim(), permissions: fPerms });
+      if (!created) return;
       setSelectedId(created.id);
       push(`Rôle « ${name} » créé`);
     }
@@ -215,7 +231,7 @@ export default function UsersPage() {
       variant: "danger",
     });
     if (!ok) return;
-    deleteRole(r.id);
+    if (!(await deleteRole(r.id))) return;
     push(`Rôle « ${r.name} » supprimé`);
     const remaining = roles.filter(x => x.id !== r.id);
     if (remaining.length > 0) loadRole(remaining[0]); else newRole();

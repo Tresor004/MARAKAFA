@@ -5,9 +5,16 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:pages": "vite --mode pages --port 5174",
     "dev:api": "cd backend && php artisan serve --host=127.0.0.1 --port=8000",
     "setup:api": "cd backend && php artisan migrate:fresh --seed --no-interaction",
+    "setup:clean": "cd backend && php artisan migrate:fresh --seed --seeder=CleanInstallSeeder --no-interaction",
     "build": "vite build",
+    "build:pages": "vite build --mode pages",
+    "build:laravel": "vite build && node scripts/publish-to-laravel.mjs",
+    "serve": "cd backend && php artisan serve --host=127.0.0.1 --port=8000",
+    "typecheck": "tsc --noEmit",
+    "test:api": "cd backend && php artisan test",
     "preview": "vite preview"
   },
   "dependencies": {

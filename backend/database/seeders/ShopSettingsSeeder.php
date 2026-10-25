@@ -2,14 +2,14 @@
 
 namespace Database\Seeders;
 
+use App\Models\ShopSetting;
 use Illuminate\Database\Seeder;
-use Illuminate\Support\Facades\DB;
 
 class ShopSettingsSeeder extends Seeder
 {
     public function run(): void
     {
-        DB::table('shop_settings')->insert([
+        ShopSetting::updateOrCreate(['id' => 1], [
             'name'              => 'Hi-Market',
             'type'              => 'Supermarché',
             'slogan'            => 'Votre supermarché de confiance',
@@ -18,8 +18,6 @@ class ShopSettingsSeeder extends Seeder
             'tax_rate'          => 0,
             'invoice_prefix'    => 'FAC',
             'thank_you_message' => 'Merci pour votre visite ! À bientôt.',
-            'created_at'        => now(),
-            'updated_at'        => now(),
         ]);
     }
 }

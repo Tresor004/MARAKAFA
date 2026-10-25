@@ -3,9 +3,11 @@ import { useStore, fmtCurrency, fmtDate } from "../store";
 import { Card, Badge, EmptyState, Button, Modal, Field, inputClass } from "../components/ui";
 import { IconPlus, IconMinus, IconSearch } from "../components/Icons";
 import { useToast } from "../components/ui";
+import StockJournal from "../components/StockJournal";
 
 export default function Stock({ initialFilter = "all" }: { initialFilter?: "all" | "low" | "expiring" | "out" }) {
   const { products, requestOrExec } = useStore();
+  const [view, setView] = useState<"stock" | "journal">("stock");
   const { push } = useToast();
   const [filter, setFilter] = useState<"all" | "low" | "expiring" | "out">(initialFilter);
   const [search, setSearch] = useState("");
@@ -28,19 +30,20 @@ export default function Stock({ initialFilter = "all" }: { initialFilter?: "all"
 
   const openModal = (productId: string, m: "add" | "remove") => { setTargetProduct(productId); setMode(m); setQty(0); setReason(""); setModalOpen(true); };
 
-  const confirmAdjust = () => {
+  const confirmAdjust = async () => {
     if (!targetProduct || qty <= 0) return push("Quantité invalide", "error");
     const p = products.find(x => x.id === targetProduct);
     if (!p) return;
     if (mode === "remove" && qty > p.stock) return push("La quantité est supérieure au stock", "error");
     const label = mode === "add" ? "Ajout au stock" : "Retrait du stock";
-    const ok = requestOrExec({
+    const ok = await requestOrExec({
       kind: "stock.adjust", module: "Stocks", action: label,
       description: `${mode === "add" ? "+" : "-"}${qty} ${p.unit} de ${p.name}`,
       details: { produit: p.name, quantité: String(qty), motif: reason || (mode === "add" ? "Réception" : "Retrait"), stockAvant: String(p.stock) },
       payload: { productId: targetProduct, delta: mode === "add" ? qty : -qty },
     });
-    push(ok ? `Stock ${mode === "add" ? "ajusté à la hausse" : "diminué"} : ${qty} ${p.unit}` : "Action en attente de validation par l'administrateur");
+    if (ok === "error") return;
+    push(ok === "done" ? `Stock ${mode === "add" ? "ajusté à la hausse" : "diminué"} : ${qty} ${p.unit}` : "Action en attente de validation par l'administrateur");
     setModalOpen(false);
   };
 
@@ -52,10 +55,18 @@ export default function Stock({ initialFilter = "all" }: { initialFilter?: "all"
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-xl sm:text-2xl lg:text-3xl font-black text-slate-900">Gestion des stocks</h1>
-        <p className="text-slate-500 text-xs sm:text-sm mt-1">Valeur du stock : <b>{fmtCurrency(totalValue)}</b> · Critique : <b>{lowCount}</b> article{lowCount > 1 ? "s" : ""}</p>
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div>
+          <h1 className="text-xl sm:text-2xl lg:text-3xl font-black text-slate-900">Gestion des stocks</h1>
+          <p className="text-slate-500 text-xs sm:text-sm mt-1">Valeur du stock : <b>{fmtCurrency(totalValue)}</b> · Critique : <b>{lowCount}</b> article{lowCount > 1 ? "s" : ""}</p>
+        </div>
+        <div className="grid grid-cols-2 sm:inline-flex bg-white border border-slate-200 rounded-xl p-1 text-sm w-full sm:w-auto">
+          <button onClick={() => setView("stock")} className={`px-4 py-2 sm:py-1.5 rounded-lg font-medium transition ${view === "stock" ? "bg-slate-900 text-white" : "text-slate-700"}`}>Articles</button>
+          <button onClick={() => setView("journal")} className={`px-4 py-2 sm:py-1.5 rounded-lg font-medium transition ${view === "journal" ? "bg-slate-900 text-white" : "text-slate-700"}`}>Journal des mouvements</button>
+        </div>
       </div>
+
+      {view === "journal" ? <StockJournal /> : (<>
 
       <Card className="p-4">
         <div className="flex flex-col md:flex-row gap-3">
@@ -151,6 +162,8 @@ export default function Stock({ initialFilter = "all" }: { initialFilter?: "all"
           );
         })}
       </div>
+
+      </>)}
 
       <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={mode === "add" ? "Ajouter au stock" : "Retirer du stock"}>
         {targetProduct && (() => {

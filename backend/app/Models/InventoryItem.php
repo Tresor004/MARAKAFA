@@ -13,9 +13,9 @@ class InventoryItem extends Model
     ];
 
     protected $casts = [
-        'expected'   => 'integer',
-        'actual'     => 'integer',
-        'difference' => 'integer',
+        'expected'   => 'float',
+        'actual'     => 'float',
+        'difference' => 'float',
     ];
 
     public function session(): BelongsTo

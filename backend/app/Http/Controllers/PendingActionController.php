@@ -2,74 +2,45 @@
 
 namespace App\Http\Controllers;
 
-use App\Http\Resources\PendingActionResource;
+use App\Http\Support\Present;
 use App\Models\PendingAction;
+use App\Services\ActionService;
 use App\Services\PendingActionService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 class PendingActionController extends Controller
 {
-    public function __construct(private readonly PendingActionService $service) {}
-
-    /**
-     * GET /api/pending-actions
-     * Admin : toutes les actions.
-     * Employé : uniquement ses propres actions.
-     */
-    public function index(Request $request)
+    /** Administrateur : toutes les demandes ; autre employé : uniquement les siennes. */
+    public function index(Request $request): JsonResponse
     {
-        $user  = $request->user();
-        $query = PendingAction::with('requester', 'reviewer')->latest();
+        $user = $request->user();
 
-        if (! $user->isAdmin()) {
-            $query->where('requested_by', $user->id);
-        }
+        $rows = PendingAction::with('requester', 'reviewer')
+            ->when(! $user->isAdmin(), fn ($q) => $q->where('requested_by', $user->id))
+            ->orderByRaw("CASE status WHEN 'pending' THEN 0 ELSE 1 END")
+            ->orderByDesc('id')
+            ->limit(500)
+            ->get();
 
-        if ($request->filled('status')) {
-            $query->where('status', $request->status);
-        }
-
-        return PendingActionResource::collection($query->paginate(50));
+        return response()->json($rows->map(fn ($a) => Present::pending($a))->values());
     }
 
-    /**
-     * POST /api/pending-actions/{id}/approve  (admin uniquement)
-     */
-    public function approve(Request $request, PendingAction $pendingAction): JsonResponse
+    public function approve(Request $request, PendingAction $pendingAction, PendingActionService $service): JsonResponse
     {
-        abort_unless($request->user()->isAdmin(), 403, 'Seul un administrateur peut approuver une demande.');
-
-        if (! $pendingAction->isPending()) {
-            return response()->json(['message' => 'Cette action n\'est plus en attente.'], 409);
-        }
-
-        $this->service->approve($pendingAction);
+        $pa = $service->approve($pendingAction, $request->user());
 
         return response()->json([
-            'message' => 'Action approuvée et appliquée.',
-            'action'  => new PendingActionResource($pendingAction->fresh('requester', 'reviewer')),
+            'pending' => Present::pending($pa),
+            'affects' => array_merge(['pending'], ActionService::affects($pa->kind)),
         ]);
     }
 
-    /**
-     * POST /api/pending-actions/{id}/reject  (admin uniquement)
-     */
-    public function reject(Request $request, PendingAction $pendingAction): JsonResponse
+    public function reject(Request $request, PendingAction $pendingAction, PendingActionService $service): JsonResponse
     {
-        abort_unless($request->user()->isAdmin(), 403, 'Seul un administrateur peut refuser une demande.');
+        $d = $request->validate(['reason' => ['nullable', 'string', 'max:500']]);
+        $pa = $service->reject($pendingAction, $request->user(), $d['reason'] ?? null);
 
-        $request->validate(['reason' => ['nullable', 'string', 'max:500']]);
-
-        if (! $pendingAction->isPending()) {
-            return response()->json(['message' => 'Cette action n\'est plus en attente.'], 409);
-        }
-
-        $this->service->reject($pendingAction, $request->reason);
-
-        return response()->json([
-            'message' => 'Action refusée.',
-            'action'  => new PendingActionResource($pendingAction->fresh('requester', 'reviewer')),
-        ]);
+        return response()->json(['pending' => Present::pending($pa), 'affects' => ['pending']]);
     }
 }

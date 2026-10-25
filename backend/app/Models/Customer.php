@@ -10,9 +10,9 @@ class Customer extends Model
 {
     use SoftDeletes;
 
-    protected $fillable = ['name', 'phone', 'email', 'address', 'total_purchases'];
+    protected $fillable = ['name', 'phone', 'email', 'address', 'total_purchases', 'credit_limit'];
 
-    protected $casts = ['total_purchases' => 'float'];
+    protected $casts = ['total_purchases' => 'float', 'credit_limit' => 'float'];
 
     public function sales(): HasMany
     {

@@ -13,7 +13,9 @@ return new class extends Migration
             $table->string('invoice_no', 30)->unique();      // FAC-2025-0001
             $table->foreignId('customer_id')->nullable()->constrained()->nullOnDelete();
             $table->foreignId('user_id')->constrained()->restrictOnDelete(); // caissier
-            $table->decimal('total', 16, 2);
+            $table->decimal('total', 16, 2);                 // montant TTC encaissé
+            $table->decimal('tax_rate', 5, 2)->default(0);   // taux de TVA appliqué (snapshot)
+            $table->decimal('tax_amount', 16, 2)->default(0);// dont TVA incluse dans le total
             $table->decimal('paid', 16, 2);
             $table->decimal('change_due', 16, 2)->default(0);
             $table->string('payment_method', 50)->default('Espèces');
@@ -33,6 +35,7 @@ return new class extends Migration
             $table->string('product_name');                  // snapshot du nom au moment de la vente
             $table->decimal('quantity', 10, 3);
             $table->decimal('unit_price', 14, 2);
+            $table->decimal('unit_cost', 14, 2)->default(0); // coût d'achat au moment de la vente (marge exacte)
             $table->decimal('total', 14, 2);
             $table->timestamps();
 

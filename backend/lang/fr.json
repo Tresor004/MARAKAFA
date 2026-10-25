@@ -1,0 +1,14 @@
+{
+    "(and :count more error)": "(et :count autre erreur)",
+    "(and :count more errors)": "(et :count autres erreurs)",
+    "Unauthenticated.": "Non authentifié.",
+    "This action is unauthorized.": "Action non autorisée.",
+    "Too Many Attempts.": "Trop de tentatives.",
+    "Too Many Requests": "Trop de requêtes",
+    "Not Found": "Introuvable",
+    "Server Error": "Erreur serveur",
+    "Forbidden": "Accès interdit",
+    "Unauthorized": "Non autorisé",
+    "Page Expired": "Page expirée",
+    "Service Unavailable": "Service indisponible"
+}

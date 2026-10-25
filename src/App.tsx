@@ -20,13 +20,20 @@ export type StockFilter = "all" | "low" | "expiring" | "out";
 export type NavOptions = { salesTab?: "pos" | "history"; stockFilter?: StockFilter };
 
 function AppRouter() {
-  const { isLoggedIn } = useStore();
+  const { isLoggedIn, ready } = useStore();
   const [active, setActive] = useState<NavKey>("dashboard");
   // Chaque fois que l'utilisateur se connecte, on revient au tableau de bord
   // (géré par useState default + reset dans useEffect si besoin)
   const [salesTab, setSalesTab] = useState<"pos" | "history">("pos");
   const [stockFilter, setStockFilter] = useState<StockFilter>("all");
 
+  if (!ready) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-100 text-slate-500 text-sm">
+        Chargement de Hi-Market…
+      </div>
+    );
+  }
   if (!isLoggedIn) return <Login />;
 
   const navigate = (key: NavKey, opts?: NavOptions) => {
@@ -62,12 +69,12 @@ function AppRouter() {
 
 export default function App() {
   return (
-    <StoreProvider>
-      <ToastProvider>
+    <ToastProvider>
+      <StoreProvider>
         <ConfirmProvider>
           <AppRouter />
         </ConfirmProvider>
-      </ToastProvider>
-    </StoreProvider>
+      </StoreProvider>
+    </ToastProvider>
   );
 }

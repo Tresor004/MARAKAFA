@@ -2,18 +2,21 @@
 
 namespace Tests\Feature;
 
-// use Illuminate\Foundation\Testing\RefreshDatabase;
 use Tests\TestCase;
 
 class ExampleTest extends TestCase
 {
-    /**
-     * A basic test example.
-     */
-    public function test_the_application_returns_a_successful_response(): void
+    /** Le point de santé de Laravel répond (l'application démarre correctement). */
+    public function test_application_health_endpoint_responds(): void
     {
-        $response = $this->get('/');
+        $this->get('/up')->assertOk();
+    }
 
-        $response->assertStatus(200);
+    /** Toute URL hors /api renvoie l'interface (ou un message explicite si elle n'est pas compilée). */
+    public function test_front_end_entry_point_is_served(): void
+    {
+        $status = $this->get('/')->getStatusCode();
+
+        $this->assertContains($status, [200, 503]);
     }
 }

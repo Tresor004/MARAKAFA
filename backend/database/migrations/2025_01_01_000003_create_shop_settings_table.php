@@ -14,7 +14,7 @@ return new class extends Migration
             $table->string('name')->default('Hi-Market');
             $table->string('type')->nullable();
             $table->string('slogan')->nullable();
-            $table->string('logo_path')->nullable();
+            $table->longText('logo')->nullable();            // logo (data-URL)
             $table->string('ifu', 50)->nullable();
             $table->string('rccm', 80)->nullable();
             $table->string('phone', 30)->nullable();

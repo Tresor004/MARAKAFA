@@ -12,11 +12,13 @@ class Purchase extends Model
     use SoftDeletes;
 
     protected $fillable = [
-        'reference', 'supplier_id', 'user_id', 'total', 'purchase_date',
+        'reference', 'supplier_id', 'user_id', 'total', 'total_ht', 'total_tax', 'purchase_date',
     ];
 
     protected $casts = [
         'total'         => 'float',
+        'total_ht'      => 'float',
+        'total_tax'     => 'float',
         'purchase_date' => 'date',
     ];
 

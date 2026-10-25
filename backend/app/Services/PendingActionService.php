@@ -2,168 +2,106 @@
 
 namespace App\Services;
 
-use App\Models\Customer;
-use App\Models\Loss;
 use App\Models\PendingAction;
-use App\Models\Product;
-use App\Models\Purchase;
-use App\Models\Supplier;
 use App\Models\User;
-use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
 
+/**
+ * Circuit de validation : un employé demande, l'administrateur approuve (l'action est alors exécutée) ou refuse.
+ */
 class PendingActionService
 {
-    public function __construct(protected NotificationService $notif) {}
+    public function __construct(
+        protected NotificationService $notif,
+        protected ActionService $actions,
+    ) {}
 
-    /**
-     * Construit et persiste une PendingAction, notifie les admins.
-     */
-    public function submit(
-        string $kind,
-        string $module,
-        string $action,
-        string $description,
-        array  $details,
-        array  $payload
-    ): PendingAction {
-        /** @var User $actor */
-        $actor = Auth::user();
-
+    /** Enregistre une demande et prévient les administrateurs. */
+    public function submit(User $actor, string $kind, array $meta, array $payload): PendingAction
+    {
         $pa = PendingAction::create([
-            'kind'          => $kind,
-            'module'        => $module,
-            'action'        => $action,
-            'description'   => $description,
-            'details'       => $details,
-            'payload'       => $payload,
-            'requested_by'  => $actor->id,
-            'status'        => 'pending',
-            'request_date'  => now()->toDateString(),
+            'kind'         => $kind,
+            'module'       => $meta['module'] ?? 'Général',
+            'action'       => $meta['action'] ?? $kind,
+            'description'  => $meta['description'] ?? '',
+            'details'      => $meta['details'] ?? [],
+            'payload'      => $payload,
+            'requested_by' => $actor->id,
+            'status'       => 'pending',
+            'request_date' => today(),
         ]);
 
-        // Notifie tous les admins
         $this->notif->notifyAdmins(
             'Nouvelle demande en attente',
-            "{$actor->name} demande : « {$action} » — {$description}",
-            'warning',
-            $actor->id,
-            $actor->name,
+            "{$actor->name} demande : « {$pa->action} » — {$pa->description}",
+            'warning', $actor->id, $actor->name, 'myspace',
         );
 
         return $pa;
     }
 
     /**
-     * Approuve une demande : exécute l'action, change le statut, notifie.
+     * Approuve : exécute l'action au nom du demandeur, passe la demande en « approuvée » et prévient l'employé.
+     * Si l'exécution échoue (stock devenu insuffisant, produit supprimé…), rien n'est modifié et l'erreur remonte.
      */
-    public function approve(PendingAction $pa): void
+    public function approve(PendingAction $pa, User $admin): PendingAction
     {
-        /** @var User $admin */
-        $admin = Auth::user();
+        return DB::transaction(function () use ($pa, $admin) {
+            $pa = PendingAction::whereKey($pa->id)->lockForUpdate()->firstOrFail();
+            if (! $pa->isPending()) {
+                throw ValidationException::withMessages(['status' => ['Cette demande a déjà été traitée.']]);
+            }
 
-        DB::transaction(function () use ($pa, $admin) {
-            // 1. Exécuter l'action
-            $this->execute($pa->kind, $pa->payload);
+            $requester = User::withTrashed()->findOrFail($pa->requested_by);
+            if (! $requester->active || $requester->trashed()) {
+                throw ValidationException::withMessages(['status' => ['L\'employé demandeur n\'est plus actif : refusez la demande.']]);
+            }
 
-            // 2. Mettre à jour le statut
+            $this->actions->execute($pa->kind, $pa->payload, $requester, $admin, $pa->description);
+
             $pa->update([
                 'status'      => 'approved',
                 'reviewed_by' => $admin->id,
                 'reviewed_at' => now(),
             ]);
 
-            // 3. Notifier l'employé demandeur
             $this->notif->notifyUser(
-                $pa->requested_by,
+                $requester->id,
                 'Demande approuvée ✓',
                 "Votre demande « {$pa->action} » ({$pa->description}) a été approuvée et appliquée par {$admin->name}.",
-                'success',
-                $admin->id,
-                $admin->name,
+                'success', $admin->id, $admin->name, ActionService::pageFor($pa->kind),
             );
 
-            // 4. Notification générale pour les actions visibles de tous
-            $generalKinds = [
-                'product.add', 'product.update', 'product.delete',
-                'customer.add', 'customer.delete',
-                'supplier.add', 'supplier.delete',
-                'purchase.add',
-            ];
-            if (in_array($pa->kind, $generalKinds, true)) {
-                $this->notif->notifyAll(
-                    "{$pa->module} — {$pa->action}",
-                    "{$pa->description} (demandé par {$pa->requester->name}, approuvé par {$admin->name}).",
-                    'info',
-                    $admin->id,
-                    $admin->name,
-                );
-            }
+            return $pa->fresh(['requester', 'reviewer']);
         });
     }
 
-    /**
-     * Refuse une demande : change le statut, notifie l'employé.
-     */
-    public function reject(PendingAction $pa, ?string $reason): void
+    /** Refuse une demande et prévient l'employé (avec le motif). */
+    public function reject(PendingAction $pa, User $admin, ?string $reason): PendingAction
     {
-        /** @var User $admin */
-        $admin = Auth::user();
+        return DB::transaction(function () use ($pa, $admin, $reason) {
+            $pa = PendingAction::whereKey($pa->id)->lockForUpdate()->firstOrFail();
+            if (! $pa->isPending()) {
+                throw ValidationException::withMessages(['status' => ['Cette demande a déjà été traitée.']]);
+            }
 
-        $pa->update([
-            'status'        => 'rejected',
-            'reviewed_by'   => $admin->id,
-            'reviewed_at'   => now(),
-            'reject_reason' => $reason,
-        ]);
+            $pa->update([
+                'status'        => 'rejected',
+                'reviewed_by'   => $admin->id,
+                'reviewed_at'   => now(),
+                'reject_reason' => $reason,
+            ]);
 
-        $suffix = $reason ? " : {$reason}" : '.';
-        $this->notif->notifyUser(
-            $pa->requested_by,
-            'Demande refusée ✗',
-            "Votre demande « {$pa->action} » ({$pa->description}) a été refusée par {$admin->name}{$suffix}",
-            'error',
-            $admin->id,
-            $admin->name,
-        );
-    }
+            $suffix = $reason ? " : {$reason}" : '.';
+            $this->notif->notifyUser(
+                $pa->requested_by,
+                'Demande refusée ✗',
+                "Votre demande « {$pa->action} » ({$pa->description}) a été refusée par {$admin->name}{$suffix}",
+                'error', $admin->id, $admin->name, 'myspace',
+            );
 
-    /**
-     * Exécute l'action correspondant au kind sur les modèles.
-     */
-    private function execute(string $kind, array $payload): void
-    {
-        match ($kind) {
-            'product.add'    => Product::create($payload),
-            'product.update' => Product::findOrFail($payload['id'])->update($payload['data']),
-            'product.delete' => Product::findOrFail($payload['id'])->delete(),
-
-            'customer.add'    => Customer::create($payload),
-            'customer.update' => Customer::findOrFail($payload['id'])->update($payload['data']),
-            'customer.delete' => Customer::findOrFail($payload['id'])->delete(),
-
-            'supplier.add'    => Supplier::create($payload),
-            'supplier.update' => Supplier::findOrFail($payload['id'])->update($payload['data']),
-            'supplier.delete' => Supplier::findOrFail($payload['id'])->delete(),
-
-            'user.add'    => User::create($payload),
-            'user.update' => User::findOrFail($payload['id'])->update($payload['data']),
-            'user.delete' => User::findOrFail($payload['id'])->delete(),
-
-            'loss.add'    => app(LossService::class)->createLoss($payload),
-            'loss.delete' => Loss::findOrFail($payload['id'])->delete(),
-
-            'stock.adjust' => app(StockService::class)->adjust($payload['product_id'], $payload['delta']),
-
-            'inventory.do' => app(InventoryService::class)->process($payload['counts'], $payload['period']),
-
-            'purchase.add'    => app(PurchaseService::class)->create($payload),
-            'purchase.update' => Purchase::findOrFail($payload['id'])->update($payload['data']),
-            'purchase.delete' => Purchase::findOrFail($payload['id'])->delete(),
-
-            'profile.update' => User::findOrFail($payload['id'])->update($payload['data']),
-
-            default => null,
-        };
+            return $pa->fresh(['requester', 'reviewer']);
+        });
     }
 }

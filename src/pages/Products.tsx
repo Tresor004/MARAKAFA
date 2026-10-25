@@ -2,11 +2,19 @@ import { useState, useMemo } from "react";
 import { useStore, fmtCurrency, fmtDate } from "../store";
 import { Product } from "../types";
 import { Modal, Button, Field, inputClass, Card, Badge, EmptyState, SearchSelect } from "../components/ui";
-import { IconPlus, IconEdit, IconTrash, IconSearch } from "../components/Icons";
+import { IconPlus, IconEdit, IconTrash, IconSearch, IconCamera } from "../components/Icons";
 import { useToast, useConfirm } from "../components/ui";
+import { api, errMsg } from "../api";
+import Promotions from "../components/Promotions";
+import LabelPrinter from "../components/LabelPrinter";
+import BarcodeSvg from "../components/BarcodeSvg";
+import { CameraScanner } from "../components/scan";
 
 export default function Products() {
-  const { products, categories, addCategory, deleteCategory, renameCategory, requestOrExec, notifyAll, isAdmin } = useStore();
+  const { products, categories, addCategory, deleteCategory, renameCategory, requestOrExec, shopSettings, promotions } = useStore();
+  const [view, setView] = useState<"catalogue" | "promotions" | "labels">("catalogue");
+  const [scanOpen, setScanOpen] = useState(false);
+  const [genBusy, setGenBusy] = useState(false);
   const { push } = useToast();
   const confirm = useConfirm();
   const [search, setSearch] = useState("");
@@ -30,27 +38,51 @@ export default function Products() {
   const openAdd = () => { setEditing(null); setForm({ category: categories[0] || "Divers", unit: "pièce", price: 0, cost: 0, stock: 0, minStock: 5 }); setOpen(true); };
   const openEdit = (p: Product) => { setEditing(p); setForm({ ...p }); setOpen(true); };
 
-  const save = () => {
+  const save = async () => {
     if (!form.name || !form.category) return push("Le nom et la catégorie sont requis", "error");
     if (editing) {
-      const ok = requestOrExec({
+      // N'envoie que les champs réellement modifiés : évite d'écraser un stock changé entre-temps par une vente.
+      const data: Record<string, unknown> = {};
+      const before = editing as unknown as Record<string, unknown>;
+      const after = form as unknown as Record<string, unknown>;
+      for (const k of ["name", "category", "price", "cost", "stock", "minStock", "unit", "barcode", "expiryDate", "taxRate"]) {
+        if (String(before[k] ?? "") !== String(after[k] ?? "")) data[k] = after[k] ?? null;
+      }
+      if (Object.keys(data).length === 0) { setOpen(false); return push("Aucune modification", "info"); }
+      const ok = await requestOrExec({
         kind: "product.update", module: "Produits", action: "Modifier un produit",
         description: `Modification de « ${form.name} »`,
         details: { produit: form.name || "", catégorie: form.category || "" },
-        payload: { id: editing.id, data: form },
+        payload: { id: editing.id, data },
       });
-      push(ok ? "Produit modifié avec succès" : "Action en attente de validation");
+      if (ok === "error") return;
+      push(ok === "done" ? "Produit modifié avec succès" : "Action en attente de validation");
     } else {
-      const ok = requestOrExec({
+      const ok = await requestOrExec({
         kind: "product.add", module: "Produits", action: "Ajouter un produit",
         description: `Ajout de « ${form.name} » — ${fmtCurrency(form.price || 0)}`,
         details: { produit: form.name || "", catégorie: form.category || "", prix: fmtCurrency(form.price || 0) },
         payload: form,
       });
-      if (ok && isAdmin) notifyAll("Nouveau produit", `Le produit « ${form.name} » a été ajouté au catalogue.`, "info");
-      push(ok ? "Produit ajouté avec succès" : "Action en attente de validation");
+      if (ok === "error") return;
+      push(ok === "done" ? "Produit ajouté avec succès" : "Action en attente de validation");
     }
     setOpen(false);
+  };
+
+  /** Demande au serveur un code EAN-13 interne (préfixe 2) garanti inutilisé. */
+  const generateBarcode = async () => {
+    setGenBusy(true);
+    try { const r = await api<{ barcode: string }>("GET", "/products/next-barcode"); setForm(f => ({ ...f, barcode: r.barcode })); }
+    catch (e) { push(errMsg(e), "error"); }
+    setGenBusy(false);
+  };
+
+  const onScanned = (code: string) => {
+    const clash = products.find(p => p.barcode === code && p.id !== editing?.id);
+    if (clash) { push(`Ce code est déjà utilisé par « ${clash.name} »`, "error"); return false; }
+    setForm(f => ({ ...f, barcode: code })); setScanOpen(false); push("Code-barres lu");
+    return true;
   };
 
   const remove = async (p: Product) => {
@@ -61,20 +93,21 @@ export default function Products() {
       variant: "danger",
     });
     if (!ok) return;
-    const ok2 = requestOrExec({
+    const ok2 = await requestOrExec({
       kind: "product.delete", module: "Produits", action: "Supprimer un produit",
       description: `Suppression de « ${p.name} »`, details: { produit: p.name },
       payload: { id: p.id },
     });
-    push(ok2 ? "Produit supprimé" : "Action en attente de validation");
+    if (ok2 === "error") return;
+    push(ok2 === "done" ? "Produit supprimé" : "Action en attente de validation");
   };
 
   // --- Category handlers
-  const handleAddCategory = () => {
+  const handleAddCategory = async () => {
     const trimmed = newCatName.trim();
     if (!trimmed) return push("Le nom de la catégorie ne peut pas être vide", "error");
     if (categories.some(c => c.toLowerCase() === trimmed.toLowerCase())) return push("Cette catégorie existe déjà", "error");
-    addCategory(trimmed);
+    if (!(await addCategory(trimmed))) return;
     setNewCatName("");
     push(`Catégorie « ${trimmed} » ajoutée`);
   };
@@ -84,27 +117,27 @@ export default function Products() {
     const ok = await confirm({
       title: "Supprimer la catégorie",
       message: count > 0
-        ? `La catégorie « ${name} » contient ${count} produit${count > 1 ? "s" : ""}. Les produits ne seront pas supprimés mais garderont cette catégorie jusqu'à modification manuelle. Continuer ?`
+        ? `La catégorie « ${name} » contient ${count} produit${count > 1 ? "s" : ""}. Les produits ne seront pas supprimés : ils n'auront simplement plus de catégorie. Continuer ?`
         : `Voulez-vous vraiment supprimer la catégorie « ${name} » ?`,
       confirmLabel: "Supprimer",
       variant: "danger",
     });
     if (!ok) return;
-    deleteCategory(name);
+    if (!(await deleteCategory(name))) return;
     push(`Catégorie « ${name} » supprimée`);
     if (cat === name) setCat("Toutes");
   };
 
   const startRename = (name: string) => { setEditingCat(name); setEditCatName(name); };
   const cancelRename = () => { setEditingCat(null); setEditCatName(""); };
-  const handleRename = () => {
+  const handleRename = async () => {
     if (!editingCat) return;
     const trimmed = editCatName.trim();
     if (!trimmed) return push("Le nom ne peut pas être vide", "error");
     if (trimmed === editingCat) return cancelRename();
     if (categories.some(c => c.toLowerCase() === trimmed.toLowerCase() && c !== editingCat)) return push("Ce nom existe déjà", "error");
     const count = products.filter(p => p.category === editingCat).length;
-    renameCategory(editingCat, trimmed);
+    if (!(await renameCategory(editingCat, trimmed))) return;
     push(`Catégorie renommée en « ${trimmed} »${count > 0 ? ` · ${count} produit${count > 1 ? "s" : ""} mis à jour` : ""}`);
     if (cat === editingCat) setCat(trimmed);
     cancelRename();
@@ -119,13 +152,25 @@ export default function Products() {
           <h1 className="text-xl sm:text-2xl lg:text-3xl font-black text-slate-900">Gestion des produits</h1>
           <p className="text-slate-500 text-xs sm:text-sm mt-1">{products.length} référence{products.length > 1 ? "s" : ""} · {categories.length} catégorie{categories.length > 1 ? "s" : ""}</p>
         </div>
-        <div className="flex gap-2 w-full sm:w-auto">
-          <Button variant="outline" onClick={() => { setCatOpen(true); setNewCatName(""); cancelRename(); }} className="flex-1 sm:flex-none">
-            <IconPlus size={16} /> <span className="sm:inline">Catégorie</span>
-          </Button>
-          <Button onClick={openAdd} className="flex-1 sm:flex-none"><IconPlus size={16} /> Produit</Button>
-        </div>
+        {view === "catalogue" && (
+          <div className="flex gap-2 w-full sm:w-auto">
+            <Button variant="outline" onClick={() => { setCatOpen(true); setNewCatName(""); cancelRename(); }} className="flex-1 sm:flex-none">
+              <IconPlus size={16} /> <span className="sm:inline">Catégorie</span>
+            </Button>
+            <Button onClick={openAdd} className="flex-1 sm:flex-none"><IconPlus size={16} /> Produit</Button>
+          </div>
+        )}
       </div>
+
+      <div className="grid grid-cols-3 sm:inline-flex bg-white border border-slate-200 rounded-xl p-1 text-sm w-full sm:w-auto">
+        {([["catalogue", "Catalogue"], ["promotions", `Promotions (${promotions.filter(p => p.running).length})`], ["labels", "Étiquettes"]] as const).map(([k, label]) => (
+          <button key={k} onClick={() => setView(k)} className={`px-4 py-2 sm:py-1.5 rounded-lg font-medium transition ${view === k ? "bg-slate-900 text-white" : "text-slate-700"}`}>{label}</button>
+        ))}
+      </div>
+
+      {view === "promotions" && <Promotions />}
+      {view === "labels" && <LabelPrinter />}
+      {view === "catalogue" && (<>
 
       <Card className="p-4">
         <div className="flex flex-col sm:flex-row gap-3">
@@ -163,8 +208,8 @@ export default function Products() {
                       <div className="font-semibold text-slate-900">{p.name}</div>
                       <div className="text-xs text-slate-500 font-mono">{p.barcode || "—"}</div>
                     </td>
-                    <td className="py-3 px-4 hidden lg:table-cell"><Badge>{p.category}</Badge></td>
-                    <td className="py-3 px-4 text-right font-bold">{fmtCurrency(p.price)}</td>
+                    <td className="py-3 px-4 hidden lg:table-cell"><Badge>{p.category || "Sans catégorie"}</Badge></td>
+                    <td className="py-3 px-4 text-right font-bold">{fmtCurrency(p.price)}<div className="text-[10px] font-normal text-slate-400">{p.taxRate === 0 ? "exonéré" : `TVA ${p.taxRate ?? shopSettings.taxRate} %`}</div></td>
                     <td className="py-3 px-4 text-right text-slate-600 hidden lg:table-cell">{fmtCurrency(p.cost)}</td>
                     <td className="py-3 px-4 text-right">
                       <Badge tone={low ? "rose" : p.stock < p.minStock * 2 ? "amber" : "emerald"}>{p.stock} {p.unit}</Badge>
@@ -194,7 +239,7 @@ export default function Products() {
                 <div className="min-w-0">
                   <div className="font-bold text-slate-900 truncate">{p.name}</div>
                   <div className="text-[11px] text-slate-500 font-mono mt-0.5">{p.barcode || "—"}</div>
-                  <div className="mt-1"><Badge>{p.category}</Badge></div>
+                  <div className="mt-1"><Badge>{p.category || "Sans catégorie"}</Badge></div>
                 </div>
                 <div className="text-right flex-shrink-0">
                   <div className="font-black text-slate-900">{fmtCurrency(p.price)}</div>
@@ -210,6 +255,8 @@ export default function Products() {
         })}
       </div>
 
+      </>)}
+
       {/* ── Product modal ── */}
       <Modal open={open} onClose={() => setOpen(false)} title={editing ? "Modifier le produit" : "Nouveau produit"} size="lg">
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -219,17 +266,44 @@ export default function Products() {
               options={categories.map(c => ({ value: c, label: c }))} />
           </Field>
           <Field label="Unité"><input className={inputClass} value={form.unit || ""} onChange={e => setForm({ ...form, unit: e.target.value })} placeholder="pièce, kg, L..." /></Field>
-          <Field label="Prix de vente (FCFA)"><input type="number" className={inputClass} value={form.price || 0} onChange={e => setForm({ ...form, price: +e.target.value })} /></Field>
-          <Field label="Coût d'achat (FCFA)"><input type="number" className={inputClass} value={form.cost || 0} onChange={e => setForm({ ...form, cost: +e.target.value })} /></Field>
+          <Field label="Prix de vente TTC"><input type="number" className={inputClass} value={form.price || 0} onChange={e => setForm({ ...form, price: +e.target.value })} /></Field>
+          <Field label="Coût d'achat HT"><input type="number" className={inputClass} value={form.cost || 0} onChange={e => setForm({ ...form, cost: +e.target.value })} /></Field>
+          <Field label="TVA du produit (%)" hint={`Vide = taux de la boutique (${shopSettings.taxRate} %). 0 = produit exonéré.`}>
+            <input type="number" min="0" max="100" step="any" className={inputClass} placeholder={String(shopSettings.taxRate)}
+              value={form.taxRate ?? ""} onChange={e => setForm({ ...form, taxRate: e.target.value === "" ? null : +e.target.value })} />
+          </Field>
+          {(() => {
+            const rate = form.taxRate ?? shopSettings.taxRate;
+            const ht = (form.price || 0) / (1 + rate / 100);
+            const margin = ht - (form.cost || 0);
+            return (
+              <div className="flex items-end"><div className="w-full rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                Prix HT : <b>{fmtCurrency(Math.round(ht * 100) / 100)}</b> · Marge unitaire : <b className={margin < 0 ? "text-rose-600" : "text-emerald-700"}>{fmtCurrency(Math.round(margin * 100) / 100)}</b>
+                {ht > 0 && <> ({Math.round((margin / ht) * 1000) / 10} %)</>}
+              </div></div>
+            );
+          })()}
           <Field label="Stock actuel"><input type="number" className={inputClass} value={form.stock || 0} onChange={e => setForm({ ...form, stock: +e.target.value })} /></Field>
           <Field label="Stock minimum"><input type="number" className={inputClass} value={form.minStock || 0} onChange={e => setForm({ ...form, minStock: +e.target.value })} /></Field>
           <Field label="Date de péremption" ><input type="date" lang="fr-FR" className={inputClass} value={form.expiryDate || ""} onChange={e => setForm({ ...form, expiryDate: e.target.value })} /></Field>
+          <div className="sm:col-span-2">
+            <Field label="Code-barres" hint="Scannez avec la douchette (cliquez dans le champ), la caméra, ou générez un code interne.">
+              <div className="flex gap-2">
+                <input className={inputClass + " font-mono"} value={form.barcode || ""} onChange={e => setForm({ ...form, barcode: e.target.value.trim() })} placeholder="Scanner ou saisir…" />
+                <Button type="button" variant="outline" onClick={() => setScanOpen(true)} title="Lire avec la caméra" aria-label="Lire avec la caméra"><IconCamera size={16} /></Button>
+                <Button type="button" variant="outline" onClick={generateBarcode} disabled={genBusy}>Générer</Button>
+              </div>
+            </Field>
+            {form.barcode && <div className="mt-2"><BarcodeSvg code={form.barcode} height={44} /></div>}
+          </div>
         </div>
         <div className="flex justify-end gap-2 mt-6">
           <Button variant="ghost" onClick={() => setOpen(false)}>Annuler</Button>
           <Button onClick={save}>{editing ? "Enregistrer" : "Créer le produit"}</Button>
         </div>
       </Modal>
+
+      <CameraScanner open={scanOpen} onClose={() => setScanOpen(false)} onDetect={onScanned} />
 
       {/* ── Category management modal ── */}
       <Modal

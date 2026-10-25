@@ -1,104 +1,255 @@
-import { useState, useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useStore, fmtCurrency, fmtDate } from "../store";
-import { Card, Button, Modal, inputClass, EmptyState, Badge, SearchSelect } from "../components/ui";
-import { IconPlus, IconMinus, IconPrinter, IconDownload, IconSearch, IconCurrency, IconTrend, IconCart, IconBox, IconAlert, IconClipboard } from "../components/Icons";
-import { useToast } from "../components/ui";
-import jsPDF from "jspdf";
+import { Card, Button, Modal, inputClass, EmptyState, Badge, useToast, useConfirm } from "../components/ui";
+import { IconPlus, IconMinus, IconPrinter, IconSearch } from "../components/Icons";
+import { printHtml } from "../utils/print";
+import { buildCountSheet, buildResultSheet, periodLabel, ResultSheetLine } from "../utils/inventorySheets";
+import type { InventoryCount, Product } from "../types";
 
-type Period = "7j" | "30j" | "90j" | "all";
+// ───────────────────────── Période d'analyse (mêmes repères que les Statistiques) ─────────────────────────
+const iso = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const daysAgo = (n: number) => { const d = new Date(); d.setDate(d.getDate() - n); return iso(d); };
+const shiftIso = (s: string, days: number) => { const d = new Date(s + "T12:00:00"); d.setDate(d.getDate() + days); return iso(d); };
+const daysBetween = (a: string, b: string) => Math.round((new Date(b + "T12:00:00").getTime() - new Date(a + "T12:00:00").getTime()) / 86400000) + 1;
 
-const PERIOD_LABEL: Record<Period, string> = {
-  "7j": "7 derniers jours",
-  "30j": "30 derniers jours",
-  "90j": "90 derniers jours",
-  "all": "Depuis le début",
+const PRESETS: { id: string; label: string; range: () => [string, string] }[] = [
+  { id: "30", label: "30 jours", range: () => [daysAgo(29), daysAgo(0)] },
+  { id: "month", label: "Ce mois", range: () => { const n = new Date(); return [iso(new Date(n.getFullYear(), n.getMonth(), 1)), iso(n)]; } },
+  { id: "lastmonth", label: "Mois dernier", range: () => { const n = new Date(); return [iso(new Date(n.getFullYear(), n.getMonth() - 1, 1)), iso(new Date(n.getFullYear(), n.getMonth(), 0))]; } },
+  { id: "90", label: "90 jours", range: () => [daysAgo(89), daysAgo(0)] },
+  { id: "365", label: "12 mois", range: () => [daysAgo(364), daysAgo(0)] },
+];
+
+type CountType = "Semaine" | "Mois";
+
+const fmtQty = (n: number) => new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 3 }).format(n);
+const pct = (n: number) => String(Math.round(n * 10) / 10).replace(".", ",") + " %";
+const signedMoney = (n: number) => (n > 0 ? "+" : n < 0 ? "−" : "") + fmtCurrency(Math.abs(n));
+
+/** Montant abrégé pour les axes : 1,2 M · 350 k */
+const compact = (n: number) => {
+  const a = Math.abs(n);
+  const f = (v: number) => String(Math.round(v * 10) / 10).replace(".", ",");
+  if (a >= 1e6) return f(n / 1e6) + " M";
+  if (a >= 1e3) return f(n / 1e3) + " k";
+  return String(Math.round(n));
 };
 
-export default function Inventory() {
-  const { products, sales, purchases, losses, inventory, shopSettings: ss, requestOrExec } = useStore();
-  const { push } = useToast();
+const Delta = ({ v, suffix = "%", invert = false }: { v: number | null | undefined; suffix?: string; invert?: boolean }) => {
+  if (v === null || v === undefined || !isFinite(v)) return <span className="text-[11px] text-slate-400">—</span>;
+  const r = Math.round(v * 10) / 10;
+  const good = invert ? r < 0 : r > 0;
+  return <Badge tone={r === 0 ? "slate" : good ? "emerald" : "rose"}>{r > 0 ? "▲" : r < 0 ? "▼" : "="} {String(Math.abs(r)).replace(".", ",")}{suffix}</Badge>;
+};
 
-  const [period, setPeriod] = useState<Period>("30j");
+// ───────────────────────── Sessions d'inventaire (lignes regroupées) ─────────────────────────
+interface SessionLine extends InventoryCount { category: string; unit: string; cost: number }
+interface Session {
+  id: string; date: string; period: string; userName: string | null;
+  lines: SessionLine[]; withDiff: number; missing: number; extra: number; net: number; accuracy: number;
+}
+
+function summarize(id: string, lines: SessionLine[]): Session {
+  const first = lines[0];
+  const withDiff = lines.filter(l => l.difference !== 0).length;
+  const missing = lines.reduce((a, l) => a + (l.difference < 0 ? -l.difference * l.cost : 0), 0);
+  const extra = lines.reduce((a, l) => a + (l.difference > 0 ? l.difference * l.cost : 0), 0);
+  return {
+    id, date: first.date, period: first.period, userName: first.userName ?? null, lines,
+    withDiff, missing, extra, net: extra - missing,
+    accuracy: lines.length ? ((lines.length - withDiff) / lines.length) * 100 : 100,
+  };
+}
+
+// ───────────────────────── Graphique des écarts par inventaire (SVG sans dépendance) ─────────────────────────
+function DiscrepancyChart({ sessions }: { sessions: Session[] }) {
+  const [hover, setHover] = useState<number | null>(null);
+  const W = 760, H = 260, L = 64, R = 12, T = 12, B = 34;
+  const iw = W - L - R, ih = H - T - B;
+  const maxV = Math.max(1, ...sessions.map(s => Math.max(s.extra, s.missing)));
+  const zero = T + ih / 2;
+  const y = (v: number) => zero - (v / maxV) * (ih / 2);
+  const x = (i: number) => L + (iw * (i + 0.5)) / sessions.length;
+  const bw = Math.max(4, Math.min(30, (iw / sessions.length) * 0.55));
+  const every = Math.max(1, Math.ceil(sessions.length / 9));
+  const hs = hover !== null ? sessions[hover] : null;
+
+  return (
+    <div>
+      <div className="min-h-[3.25rem] text-xs text-slate-600 mb-2" aria-live="polite">
+        {hs ? (
+          <div className="flex flex-wrap gap-x-5 gap-y-1">
+            <span className="font-bold text-slate-900">{fmtDate(hs.date)} · {hs.period}</span>
+            <span>Manquants : <b className="text-rose-600">{fmtCurrency(hs.missing)}</b></span>
+            <span>Excédents : <b className="text-emerald-700">{fmtCurrency(hs.extra)}</b></span>
+            <span>{hs.withDiff} écart{hs.withDiff > 1 ? "s" : ""} sur {hs.lines.length} articles</span>
+            <span>Exactitude : <b>{pct(hs.accuracy)}</b></span>
+          </div>
+        ) : <span className="text-slate-400">Survolez ou touchez une barre pour voir le détail.</span>}
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto select-none" role="img" aria-label="Valeur des écarts par inventaire">
+        {[-1, -0.5, 0, 0.5, 1].map(f => (
+          <g key={f}>
+            <line x1={L} x2={W - R} y1={y(f * maxV)} y2={y(f * maxV)} stroke={f === 0 ? "#94a3b8" : "#e2e8f0"} strokeWidth="1" />
+            <text x={L - 8} y={y(f * maxV) + 4} textAnchor="end" fontSize="11" fill="#64748b">{f === 0 ? "0" : (f > 0 ? "+" : "−") + compact(Math.abs(f) * maxV)}</text>
+          </g>
+        ))}
+        {sessions.map((s, i) => (
+          <g key={s.id}>
+            <rect x={x(i) - bw / 2} y={y(s.extra)} width={bw} height={Math.max(0, zero - y(s.extra))} rx="2" fill={hover === i ? "#047857" : "#059669"} />
+            <rect x={x(i) - bw / 2} y={zero} width={bw} height={Math.max(0, y(-s.missing) - zero)} rx="2" fill={hover === i ? "#be123c" : "#e11d48"} />
+            {(i % every === 0 || i === sessions.length - 1) && <text x={x(i)} y={H - 12} textAnchor="middle" fontSize="10.5" fill="#64748b">{fmtDate(s.date).slice(0, 5)}</text>}
+            <rect x={x(i) - iw / sessions.length / 2} y={T} width={iw / sessions.length} height={ih} fill="transparent"
+              onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(h => (h === i ? null : h))} onClick={() => setHover(i)} />
+          </g>
+        ))}
+      </svg>
+      <div className="flex flex-wrap gap-x-5 gap-y-1 text-[11px] text-slate-600 mt-1">
+        <span className="inline-flex items-center gap-1.5"><i className="inline-block w-3 h-3 rounded-sm bg-emerald-600" /> Excédents (compté &gt; théorique)</span>
+        <span className="inline-flex items-center gap-1.5"><i className="inline-block w-3 h-3 rounded-sm bg-rose-600" /> Manquants (compté &lt; théorique)</span>
+      </div>
+    </div>
+  );
+}
+
+export default function Inventory() {
+  const { products, losses, inventory, categories, shopSettings: ss, requestOrExec, currentUser } = useStore();
+  const { push } = useToast();
+  const confirm = useConfirm();
+
+  // Filtres (barre identique à celle des Statistiques)
+  const [preset, setPreset] = useState("90");
+  const [from, setFrom] = useState(PRESETS[3].range()[0]);
+  const [to, setTo] = useState(PRESETS[3].range()[1]);
+  const [typeFilter, setTypeFilter] = useState<"all" | CountType>("all");
+  const [category, setCategory] = useState("");
+  const pickPreset = (id: string) => { const p = PRESETS.find(x => x.id === id); if (!p) return; const [f, t] = p.range(); setPreset(id); setFrom(f); setTo(t); };
+
+  // Comptage
   const [open, setOpen] = useState(false);
-  const [countPeriod, setCountPeriod] = useState<"Semaine" | "Mois">("Semaine");
+  const [countType, setCountType] = useState<CountType>("Semaine");
   const [search, setSearch] = useState("");
   const [counts, setCounts] = useState<Record<string, number>>({});
-  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [lastSaved, setLastSaved] = useState<{ lines: ResultSheetLine[]; period: string; date: string } | null>(null);
 
-  // ------- Bornes de dates
-  const fromDate = useMemo(() => {
-    if (period === "all") return "0000-00-00";
-    const days = period === "7j" ? 7 : period === "30j" ? 30 : 90;
-    return new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
-  }, [period]);
+  // Impression d'une fiche de comptage vierge
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const [sheetType, setSheetType] = useState<CountType>("Semaine");
+  const [sheetCategory, setSheetCategory] = useState("");
+  const [sheetShowExpected, setSheetShowExpected] = useState(false);
 
-  // ------- Calculs du rapport
-  const report = useMemo(() => {
-    const costOf = (productId: string, fallback: number) => products.find(p => p.id === productId)?.cost ?? fallback;
+  // Détail d'un inventaire de l'historique
+  const [detail, setDetail] = useState<Session | null>(null);
 
-    const salesInPeriod = sales.filter(s => s.date >= fromDate);
-    const purchasesInPeriod = purchases.filter(p => p.date >= fromDate);
-    const lossesInPeriod = losses.filter(l => l.date >= fromDate);
+  const productById = useMemo(() => new Map(products.map(p => [p.id, p])), [products]);
+  const inCategory = (cat: string) => !category || cat === category;
 
-    const revenue = salesInPeriod.reduce((a, s) => a + s.total, 0);
-    const cogs = salesInPeriod.reduce((a, s) =>
-      a + s.items.reduce((b, it) => b + costOf(it.productId, it.price) * it.quantity, 0), 0);
-    const grossProfit = revenue - cogs;
-    const margin = revenue > 0 ? (grossProfit / revenue) * 100 : 0;
-
-    const purchasesTotal = purchasesInPeriod.reduce((a, p) => a + p.total, 0);
-    const lossesTotal = lossesInPeriod.reduce((a, l) => a + l.total, 0);
-    const netResult = grossProfit - lossesTotal;
-
-    const nbSales = salesInPeriod.length;
-    const avgBasket = nbSales > 0 ? revenue / nbSales : 0;
-    const itemsSold = salesInPeriod.reduce((a, s) => a + s.items.reduce((b, it) => b + it.quantity, 0), 0);
-
-    // Stock actuel
-    const stockValueCost = products.reduce((a, p) => a + p.stock * p.cost, 0);
-    const stockValueSale = products.reduce((a, p) => a + p.stock * p.price, 0);
-    const lowStock = products.filter(p => p.stock <= p.minStock).length;
-    const outStock = products.filter(p => p.stock === 0).length;
-
-    // Top produits (par CA sur la période)
-    const topMap: Record<string, { name: string; qty: number; total: number; profit: number }> = {};
-    salesInPeriod.forEach(s => s.items.forEach(it => {
-      if (!topMap[it.productId]) topMap[it.productId] = { name: it.name, qty: 0, total: 0, profit: 0 };
-      topMap[it.productId].qty += it.quantity;
-      topMap[it.productId].total += it.total;
-      topMap[it.productId].profit += (it.price - costOf(it.productId, it.price)) * it.quantity;
-    }));
-    const topProducts = Object.values(topMap).sort((a, b) => b.total - a.total).slice(0, 5);
-
-    // Répartition par mode de paiement
-    const payMap: Record<string, { count: number; total: number }> = {};
-    salesInPeriod.forEach(s => {
-      const m = s.paymentMethod || "Espèces";
-      if (!payMap[m]) payMap[m] = { count: 0, total: 0 };
-      payMap[m].count += 1;
-      payMap[m].total += s.total;
+  // ------- Sessions d'inventaire enrichies (catégorie, unité, coût actuel du produit)
+  const sessions = useMemo(() => {
+    const groups = new Map<string, SessionLine[]>();
+    inventory.forEach(r => {
+      const p = productById.get(r.productId);
+      const line: SessionLine = { ...r, category: p?.category ?? "", unit: p?.unit ?? "", cost: p?.cost ?? 0 };
+      const key = r.sessionId || `${r.date}|${r.period}`;
+      groups.set(key, [...(groups.get(key) ?? []), line]);
     });
-    const payments = Object.entries(payMap).map(([method, v]) => ({ method, ...v })).sort((a, b) => b.total - a.total);
+    return [...groups.entries()].map(([id, lines]) => summarize(id, lines))
+      .sort((a, b) => b.date.localeCompare(a.date) || Number(b.id) - Number(a.id));
+  }, [inventory, productById]);
 
-    // Meilleur client
-    const custMap: Record<string, { name: string; total: number }> = {};
-    salesInPeriod.forEach(s => {
-      const key = s.customerId || "passage";
-      const name = s.customerName || "Client passage";
-      if (!custMap[key]) custMap[key] = { name, total: 0 };
-      custMap[key].total += s.total;
-    });
-    const topCustomers = Object.values(custMap).sort((a, b) => b.total - a.total).slice(0, 3);
+  // Sessions filtrées (période, type, catégorie) — recalculées sur les seules lignes de la catégorie choisie
+  const filterSessions = (f: string, t: string) => sessions
+    .filter(s => s.date >= f && s.date <= t && (typeFilter === "all" || s.period === typeFilter))
+    .map(s => category ? summarize(s.id, s.lines.filter(l => l.category === category)) : s)
+    .filter(s => s.lines.length > 0);
 
-    return {
-      revenue, cogs, grossProfit, margin, purchasesTotal, lossesTotal, netResult,
-      nbSales, avgBasket, itemsSold, stockValueCost, stockValueSale, lowStock, outStock,
-      topProducts, payments, topCustomers,
-      nbLosses: lossesInPeriod.length, nbPurchases: purchasesInPeriod.length,
+  const periodDays = daysBetween(from, to);
+  const prevFrom = shiftIso(from, -periodDays), prevTo = shiftIso(from, -1);
+  const current = useMemo(() => filterSessions(from, to), [sessions, from, to, typeFilter, category]); // eslint-disable-line react-hooks/exhaustive-deps
+  const previous = useMemo(() => filterSessions(prevFrom, prevTo), [sessions, prevFrom, prevTo, typeFilter, category]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ------- Indicateurs
+  const kpis = useMemo(() => {
+    const list = products.filter(p => inCategory(p.category));
+    const stockCost = list.reduce((a, p) => a + Math.max(0, p.stock) * p.cost, 0);
+    const stockSale = list.reduce((a, p) => a + Math.max(0, p.stock) * p.price, 0);
+    const units = list.reduce((a, p) => a + Math.max(0, p.stock), 0);
+    const low = list.filter(p => p.stock > 0 && p.stock <= p.minStock).length;
+    const out = list.filter(p => p.stock <= 0).length;
+
+    const agg = (ss: Session[]) => {
+      const lines = ss.reduce((a, s) => a + s.lines.length, 0);
+      const withDiff = ss.reduce((a, s) => a + s.withDiff, 0);
+      return {
+        count: ss.length, lines, withDiff,
+        missing: ss.reduce((a, s) => a + s.missing, 0), extra: ss.reduce((a, s) => a + s.extra, 0),
+        accuracy: lines ? ((lines - withDiff) / lines) * 100 : null,
+      };
     };
-  }, [products, sales, purchases, losses, fromDate]);
+    const lossTotal = (f: string, t: string) => losses
+      .filter(l => l.date >= f && l.date <= t && inCategory(productById.get(l.productId)?.category ?? ""))
+      .reduce((a, l) => ({ total: a.total + l.total, count: a.count + 1 }), { total: 0, count: 0 });
 
-  // ------- Inventaire physique
+    const cur = agg(current), prev = agg(previous);
+    const lossCur = lossTotal(from, to), lossPrev = lossTotal(prevFrom, prevTo);
+    return {
+      stockCost, stockSale, units, refs: list.length, low, out, cur, prev, lossCur,
+      accuracyDelta: cur.accuracy !== null && prev.accuracy !== null ? cur.accuracy - prev.accuracy : null,
+      lossDelta: lossPrev.total > 0 ? ((lossCur.total - lossPrev.total) / lossPrev.total) * 100 : null,
+      missingDelta: prev.missing > 0 ? ((cur.missing - prev.missing) / prev.missing) * 100 : null,
+    };
+  }, [products, losses, current, previous, category, from, to, prevFrom, prevTo, productById]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Valeur du stock par catégorie
+  const byCategory = useMemo(() => {
+    const m = new Map<string, { cost: number; sale: number; units: number; refs: number; low: number }>();
+    products.filter(p => inCategory(p.category)).forEach(p => {
+      const k = p.category || "Sans catégorie";
+      const r = m.get(k) ?? { cost: 0, sale: 0, units: 0, refs: 0, low: 0 };
+      r.cost += Math.max(0, p.stock) * p.cost; r.sale += Math.max(0, p.stock) * p.price;
+      r.units += Math.max(0, p.stock); r.refs += 1; if (p.stock <= p.minStock) r.low += 1;
+      m.set(k, r);
+    });
+    const total = [...m.values()].reduce((a, r) => a + r.cost, 0);
+    return [...m.entries()].map(([name, r]) => ({ name, ...r, share: total > 0 ? (r.cost / total) * 100 : 0 }))
+      .sort((a, b) => b.cost - a.cost);
+  }, [products, category]); // eslint-disable-line react-hooks/exhaustive-deps
+  const maxCatCost = Math.max(1, ...byCategory.map(c => c.cost));
+
+  // Produits aux écarts les plus importants (cumul sur la période)
+  const topDiscrepancies = useMemo(() => {
+    const m = new Map<string, { name: string; times: number; qty: number; value: number; unit: string }>();
+    current.forEach(s => s.lines.filter(l => l.difference !== 0).forEach(l => {
+      const k = l.productId || l.productName;
+      const r = m.get(k) ?? { name: l.productName, times: 0, qty: 0, value: 0, unit: l.unit };
+      r.times += 1; r.qty += l.difference; r.value += l.difference * l.cost;
+      m.set(k, r);
+    }));
+    return [...m.values()].sort((a, b) => Math.abs(b.value) - Math.abs(a.value)).slice(0, 8);
+  }, [current]);
+
+  const chartSessions = useMemo(() => [...current].reverse().slice(-30), [current]);
+
+  // ------- Impressions
+  const printCountSheet = () => {
+    const list = products.filter(p => !sheetCategory || p.category === sheetCategory);
+    printHtml(buildCountSheet({
+      ss, period: sheetType, showExpected: sheetShowExpected, categoryLabel: sheetCategory || "Toutes",
+      products: list.map(p => ({ name: p.name, category: p.category, barcode: p.barcode, unit: p.unit, stock: p.stock })),
+    }), "Fiche de comptage");
+    setSheetOpen(false);
+  };
+
+  const printSession = (s: Session, onlyDiscrepancies = false) => printHtml(buildResultSheet({
+    ss, period: s.period, date: s.date, userName: s.userName, onlyDiscrepancies,
+    lines: s.lines.map(l => ({ name: l.productName, category: l.category, unit: l.unit, expected: l.expected, actual: l.actual, cost: l.cost })),
+  }), "Fiche d'inventaire");
+
+  const countLines = (): ResultSheetLine[] => products.map(p => ({
+    name: p.name, category: p.category, unit: p.unit, expected: p.stock, actual: counts[p.id] ?? p.stock, cost: p.cost,
+  }));
+
+  // ------- Comptage physique
   const startInventory = () => {
     setCounts(Object.fromEntries(products.map(p => [p.id, p.stock])));
     setSearch("");
@@ -106,483 +257,285 @@ export default function Inventory() {
   };
 
   const filteredProducts = products.filter(p => p.name.toLowerCase().includes(search.toLowerCase()));
-  const expected = filteredProducts.reduce((a, p) => a + p.stock, 0);
-  const actual = filteredProducts.reduce((a, p) => a + (counts[p.id] ?? p.stock), 0);
-
   const countSummary = useMemo(() => {
     const totalExpected = products.reduce((a, b) => a + b.stock * b.cost, 0);
     const totalActual = products.reduce((a, b) => a + (counts[b.id] ?? b.stock) * b.cost, 0);
-    return { totalExpected, totalActual, diff: totalActual - totalExpected };
+    const withDiff = products.filter(p => (counts[p.id] ?? p.stock) !== p.stock).length;
+    return { totalExpected, totalActual, diff: totalActual - totalExpected, withDiff };
   }, [products, counts]);
 
-  const saveInventory = () => {
-    const entries = products.map(p => ({ productId: p.id, productName: p.name, expected: p.stock, actual: counts[p.id] ?? p.stock }));
-    const totalDiff = entries.reduce((a, e) => a + Math.abs(e.actual - e.expected), 0);
-    const ok = requestOrExec({
-      kind: "inventory.do", module: "Inventaire", action: `Inventaire ${countPeriod.toLowerCase()}`,
-      description: `${products.length} articles comptés — ${totalDiff > 0 ? totalDiff + " écarts" : "Aucun écart"}`,
-      details: { articles: String(products.length), écarts: String(totalDiff), période: countPeriod },
-      payload: { counts: entries, period: countPeriod },
-    });
-    push(ok ? `Inventaire ${countPeriod.toLowerCase()} validé (${products.length} articles)` : "Action en attente de validation par l'administrateur");
-    setOpen(false); setConfirmOpen(ok);
-  };
-
-  // ------- Export PDF feuille d'inventaire physique (style Inventory Sheet)
-  const exportInventorySheetPDF = () => {
-    const doc = new jsPDF({ unit: "mm", format: "a4", orientation: "portrait" });
-    const pageW = 210, M = 14;
-    const shopName = ss.name || "Hi-Market";
-    const today = new Date().toLocaleDateString("fr-FR");
-
-    // Titre
-    doc.setFont("helvetica", "black");
-    doc.setFontSize(28);
-    doc.setTextColor(15, 23, 42);
-    doc.text("FEUILLE D'INVENTAIRE", pageW / 2, 22, { align: "center" });
-
-    // Département & Date
-    doc.setFont("helvetica", "normal");
-    doc.setFontSize(10);
-    doc.setTextColor(30, 41, 59);
-    doc.text(`Établissement : ${shopName}`, M, 32);
-    doc.text(`Période : ${countPeriod}`, M + 90, 32);
-    doc.text(`Date : ${today}`, M + 150, 32);
-
-    // Ligne de séparation sous le titre
-    doc.setDrawColor(15, 23, 42);
-    doc.setLineWidth(0.6);
-    doc.line(M, 36, pageW - M, 36);
-
-    // En-tête du tableau
-    const rowH  = 8.5;
-    const col1  = M;
-    const col2  = M + 50;
-    const col3  = M + 132;
-    const col4  = M + 158;
-    let y = 44;
-
-    doc.setFillColor(241, 245, 249);
-    doc.rect(col1, y - 5, pageW - 2 * M, rowH, "F");
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(9);
-    doc.setTextColor(15, 23, 42);
-    doc.text("ARTICLE", col1 + 2, y);
-    doc.text("DÉSIGNATION / CATÉGORIE", col2 + 2, y);
-    doc.text("QTÉ THÉO.", col3, y, { align: "right" });
-    doc.text("QTÉ RÉELLE", col4, y, { align: "right" });
-    doc.text("ÉCART", pageW - M - 2, y, { align: "right" });
-    y += rowH;
-
-    // Lignes produits
-    doc.setFont("helvetica", "normal");
-    doc.setFontSize(8.5);
-    const list = search
-      ? products.filter(p => p.name.toLowerCase().includes(search.toLowerCase()))
-      : products;
-
-    list.forEach((p, i) => {
-      if (y > 268) { doc.addPage(); y = 20; }
-      const actual = counts[p.id] ?? p.stock;
-      const diff = actual - p.stock;
-
-      // Zebra
-      if (i % 2 === 0) {
-        doc.setFillColor(250, 250, 250);
-        doc.rect(col1, y - 5.5, pageW - 2 * M, rowH, "F");
-      }
-
-      // Séparateur pointillé
-      doc.setDrawColor(203, 213, 225);
-      doc.setLineWidth(0.2);
-      doc.line(col1, y + 2.5, pageW - M, y + 2.5);
-
-      doc.setTextColor(30, 41, 59);
-      doc.text(p.name.length > 28 ? p.name.slice(0, 27) + "…" : p.name, col1 + 2, y);
-      doc.setTextColor(100, 116, 139);
-      doc.text(p.category || "—", col2 + 2, y);
-      doc.setTextColor(30, 41, 59);
-      doc.text(String(p.stock), col3, y, { align: "right" });
-      doc.text(String(actual), col4, y, { align: "right" });
-
-      // Couleur écart
-      if (diff < 0) doc.setTextColor(220, 38, 38);
-      else if (diff > 0) doc.setTextColor(22, 163, 74);
-      else doc.setTextColor(100, 116, 139);
-      doc.setFont("helvetica", diff !== 0 ? "bold" : "normal");
-      doc.text((diff >= 0 ? "+" : "") + diff, pageW - M - 2, y, { align: "right" });
-      doc.setFont("helvetica", "normal");
-      y += rowH;
-    });
-
-    // Lignes vides si peu de produits
-    const minRows = 25;
-    if (list.length < minRows) {
-      doc.setTextColor(203, 213, 225);
-      for (let r = list.length; r < minRows; r++) {
-        if (y > 268) { doc.addPage(); y = 20; }
-        doc.setDrawColor(203, 213, 225);
-        doc.setLineWidth(0.2);
-        doc.line(col1, y + 2.5, pageW - M, y + 2.5);
-        y += rowH;
-      }
-    }
-
-    // Ligne de fin
-    doc.setDrawColor(15, 23, 42);
-    doc.setLineWidth(0.4);
-    doc.line(M, y + 3, pageW - M, y + 3);
-
-    // Notes
-    y += 8;
-    if (y > 265) { doc.addPage(); y = 20; }
-    doc.setFont("helvetica", "normal");
-    doc.setFontSize(9.5);
-    doc.setTextColor(30, 41, 59);
-    doc.text("NOTES :", M, y);
-    doc.setDrawColor(203, 213, 225);
-    doc.setLineWidth(0.3);
-    for (let n = 0; n < 3; n++) {
-      if (y + 8 + n * 8 > 278) break;
-      doc.line(M + 18, y + n * 8, pageW - M, y + n * 8);
-    }
-
-    // Pied
-    doc.setFontSize(8);
-    doc.setTextColor(148, 163, 184);
-    doc.text(`Feuille d'inventaire générée par ${shopName} le ${today}`, pageW / 2, 288, { align: "center" });
-
-    doc.save(`Inventaire_${countPeriod}_${new Date().toISOString().slice(0, 10)}.pdf`);
-  };
-
-  // ------- Export PDF du rapport complet
-  const nf = (n: number) => Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, " ");
-  const exportReportPDF = () => {
-    const doc = new jsPDF({ unit: "mm", format: "a4" });
-    const pageW = 210, M = 15;
-    const cur = ss.currency || "FCFA";
-    const shopName = ss.name || "Hi-Market";
-
-    // En-tête
-    doc.setFont("helvetica", "bold"); doc.setFontSize(20); doc.setTextColor(15, 23, 42);
-    doc.text(shopName, M, 20);
-    doc.setFont("helvetica", "normal"); doc.setFontSize(9.5); doc.setTextColor(71, 85, 105);
-    const idParts = [ss.ifu ? "IFU : " + ss.ifu : "", ss.rccm ? "RCCM : " + ss.rccm : ""].filter(Boolean);
-    if (idParts.length) doc.text(idParts.join("  ·  "), M, 26);
-
-    doc.setFillColor(15, 23, 42); doc.roundedRect(pageW - M - 68, 12, 68, 22, 2, 2, "F");
-    doc.setTextColor(255, 255, 255); doc.setFont("helvetica", "bold"); doc.setFontSize(12);
-    doc.text("RAPPORT D'ACTIVITÉ", pageW - M - 4, 20, { align: "right" });
-    doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
-    doc.text(PERIOD_LABEL[period], pageW - M - 4, 26, { align: "right" });
-    doc.text("Édité le " + fmtDate(new Date().toISOString().slice(0, 10)), pageW - M - 4, 31, { align: "right" });
-
-    let y = 42;
-    doc.setDrawColor(15, 23, 42); doc.setLineWidth(0.6); doc.line(M, y, pageW - M, y); y += 8;
-
-    // Bloc financier
-    doc.setFont("helvetica", "bold"); doc.setFontSize(12); doc.setTextColor(15, 23, 42);
-    doc.text("Synthèse financière", M, y); y += 7;
-
-    const rows: [string, string, boolean?][] = [
-      ["Chiffre d'affaires", nf(report.revenue) + " " + cur],
-      ["Coût des marchandises vendues", "- " + nf(report.cogs) + " " + cur],
-      ["Bénéfice brut  (marge " + report.margin.toFixed(1) + "%)", nf(report.grossProfit) + " " + cur, true],
-      ["Pertes & péremptions", "- " + nf(report.lossesTotal) + " " + cur],
-      ["Résultat net estimé", nf(report.netResult) + " " + cur, true],
-      ["Achats fournisseurs (sorties de trésorerie)", nf(report.purchasesTotal) + " " + cur],
-    ];
-    doc.setFontSize(10);
-    rows.forEach(([label, val, strong]) => {
-      if (strong) {
-        doc.setFillColor(241, 245, 249); doc.rect(M, y - 4.5, pageW - 2 * M, 7, "F");
-        doc.setFont("helvetica", "bold"); doc.setTextColor(15, 23, 42);
-      } else {
-        doc.setFont("helvetica", "normal"); doc.setTextColor(71, 85, 105);
-      }
-      doc.text(label, M + 2, y);
-      doc.text(val, pageW - M - 2, y, { align: "right" });
-      y += 7;
-    });
-
-    y += 5;
-    // Indicateurs opérationnels
-    doc.setFont("helvetica", "bold"); doc.setFontSize(12); doc.setTextColor(15, 23, 42);
-    doc.text("Indicateurs opérationnels", M, y); y += 7;
-    const ops: [string, string][] = [
-      ["Nombre de ventes", String(report.nbSales)],
-      ["Articles vendus", String(report.itemsSold)],
-      ["Panier moyen", nf(report.avgBasket) + " " + cur],
-      ["Commandes fournisseurs", String(report.nbPurchases)],
-      ["Valeur du stock (coût)", nf(report.stockValueCost) + " " + cur],
-      ["Valeur du stock (vente)", nf(report.stockValueSale) + " " + cur],
-      ["Articles en stock critique", String(report.lowStock)],
-      ["Articles en rupture", String(report.outStock)],
-    ];
-    doc.setFontSize(10); doc.setFont("helvetica", "normal"); doc.setTextColor(71, 85, 105);
-    ops.forEach(([label, val], i) => {
-      const col = i % 2; const cx = M + col * ((pageW - 2 * M) / 2);
-      if (col === 0 && i > 0) y += 7;
-      doc.text(label, cx + 2, y);
-      doc.setFont("helvetica", "bold"); doc.setTextColor(15, 23, 42);
-      doc.text(val, cx + (pageW - 2 * M) / 2 - 2, y, { align: "right" });
-      doc.setFont("helvetica", "normal"); doc.setTextColor(71, 85, 105);
-    });
-    y += 12;
-
-    // Top produits
-    if (report.topProducts.length > 0) {
-      if (y > 240) { doc.addPage(); y = 20; }
-      doc.setFont("helvetica", "bold"); doc.setFontSize(12); doc.setTextColor(15, 23, 42);
-      doc.text("Top produits vendus", M, y); y += 7;
-      doc.setFillColor(241, 245, 249); doc.rect(M, y - 4.5, pageW - 2 * M, 7, "F");
-      doc.setFontSize(9); doc.text("Produit", M + 2, y);
-      doc.text("Qté", 120, y, { align: "right" });
-      doc.text("CA", 160, y, { align: "right" });
-      doc.text("Bénéf.", pageW - M - 2, y, { align: "right" });
-      y += 7;
-      doc.setFont("helvetica", "normal"); doc.setTextColor(30, 41, 59);
-      report.topProducts.forEach(p => {
-        doc.text(p.name.length > 40 ? p.name.slice(0, 39) + "…" : p.name, M + 2, y);
-        doc.text(String(p.qty), 120, y, { align: "right" });
-        doc.text(nf(p.total), 160, y, { align: "right" });
-        doc.text(nf(p.profit), pageW - M - 2, y, { align: "right" });
-        y += 6.5;
+  const saveInventory = async () => {
+    // Garde-fou contre les fautes de frappe (ex. « 7272 » au lieu de « 72 »)
+    const suspicious = products.filter(p => (counts[p.id] ?? p.stock) > p.stock * 5 + 20);
+    if (suspicious.length > 0) {
+      const ok = await confirm({
+        title: "Quantités inhabituelles",
+        message: `Ces quantités sont très supérieures au stock théorique : ${suspicious.slice(0, 5).map(p => `${p.name} (${fmtQty(counts[p.id] ?? p.stock)} au lieu de ${fmtQty(p.stock)})`).join(", ")}${suspicious.length > 5 ? "…" : ""}. Valider quand même ?`,
+        confirmLabel: "Valider quand même",
       });
+      if (!ok) return;
     }
-
-    // Pied
-    doc.setFontSize(8); doc.setTextColor(148, 163, 184);
-    doc.text(`Rapport généré par ${shopName} © ${new Date().getFullYear()}`, pageW / 2, 288, { align: "center" });
-
-    doc.save(`Rapport_${period}_${new Date().toISOString().slice(0, 10)}.pdf`);
+    const entries = products.map(p => ({ productId: p.id, productName: p.name, expected: p.stock, actual: counts[p.id] ?? p.stock }));
+    const ok = await requestOrExec({
+      kind: "inventory.do", module: "Inventaire", action: `Inventaire ${periodLabel(countType)}`,
+      description: `${products.length} articles comptés — ${countSummary.withDiff > 0 ? countSummary.withDiff + " écart(s)" : "Aucun écart"}`,
+      details: { articles: String(products.length), écarts: String(countSummary.withDiff), période: countType },
+      payload: { counts: entries, period: countType },
+    });
+    if (ok === "error") return;
+    push(ok === "done" ? `Inventaire ${periodLabel(countType)} validé (${products.length} articles)` : "Action en attente de validation par l'administrateur");
+    if (ok === "done") setLastSaved({ lines: countLines(), period: countType, date: iso(new Date()) });
+    setOpen(false);
   };
 
-  // Composant carte KPI
-  const kpi = (label: string, value: string, icon: React.ReactNode, tone: string, sub?: string, subTone = "text-slate-500") => (
-    <Card className="p-4 sm:p-5 flex flex-col">
-      <div className="flex items-start justify-between">
-        <div className="min-w-0 flex-1">
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">{label}</p>
-          <p className="text-lg sm:text-2xl font-black text-slate-900 mt-1.5 truncate">{value}</p>
-        </div>
-        <div className={`w-10 h-10 sm:w-11 sm:h-11 rounded-xl flex items-center justify-center flex-shrink-0 ${tone}`}>{icon}</div>
+  const kpi = (label: string, value: string, sub: string, delta?: React.ReactNode, valueTone = "text-slate-900") => (
+    <Card className="p-4">
+      <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">{label}</p>
+      <p className={`text-base sm:text-2xl font-black mt-1 truncate ${valueTone}`}>{value}</p>
+      <div className="flex items-center justify-between mt-2 gap-2 min-h-[1.5rem]">
+        <span className="text-[11px] text-slate-500 truncate">{sub}</span>
+        {delta}
       </div>
-      {sub && <p className={`text-[11px] mt-auto pt-3 text-right font-medium ${subTone}`}>{sub}</p>}
     </Card>
   );
+  const k = kpis;
+  const lastSession = current[0];
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+    <div className="space-y-5">
+      {/* En-tête */}
+      <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
         <div className="min-w-0">
-          <h1 className="text-xl sm:text-2xl lg:text-3xl font-black text-slate-900">Inventaire & Rapports</h1>
-          <p className="text-slate-500 text-xs sm:text-sm mt-1">Analyse d'activité · {PERIOD_LABEL[period]}</p>
+          <h1 className="text-xl sm:text-2xl lg:text-3xl font-black text-slate-900">Inventaire</h1>
+          <p className="text-slate-500 text-xs sm:text-sm mt-1">Valeur du stock, comptages et écarts · {sessions.length} inventaire{sessions.length > 1 ? "s" : ""} enregistré{sessions.length > 1 ? "s" : ""}</p>
         </div>
-        <div className="flex items-center gap-2 w-full sm:w-auto">
-          <SearchSelect className="flex-1 sm:w-44" value={period} onChange={v => setPeriod(v as Period)}
-            options={[
-              { value: "7j", label: "7 derniers jours" },
-              { value: "30j", label: "30 derniers jours" },
-              { value: "90j", label: "90 derniers jours" },
-              { value: "all", label: "Depuis le début" },
-            ]} />
-          <Button variant="outline" onClick={exportReportPDF} className="flex-shrink-0"><IconDownload size={16} /> <span className="hidden sm:inline">Rapport</span></Button>
+        <div className="grid grid-cols-2 sm:flex gap-2 w-full sm:w-auto">
+          <Button variant="outline" onClick={() => { setSheetType(countType); setSheetOpen(true); }} className="whitespace-nowrap"><IconPrinter size={16} /> Fiche de comptage</Button>
+          <Button onClick={startInventory} className="whitespace-nowrap"><IconPlus size={16} /> Nouveau comptage</Button>
         </div>
       </div>
 
-      {/* KPIs financiers */}
-      <div className="grid grid-cols-2 xl:grid-cols-4 gap-3">
-        {kpi("Chiffre d'affaires", fmtCurrency(report.revenue), <IconCurrency className="text-white" size={20} />, "bg-slate-900", `${report.nbSales} vente${report.nbSales > 1 ? "s" : ""}`)}
-        {kpi("Bénéfice brut", fmtCurrency(report.grossProfit), <IconTrend className="text-white" size={20} />, "bg-emerald-600", `Marge ${report.margin.toFixed(1)}%`, report.grossProfit >= 0 ? "text-emerald-600" : "text-rose-600")}
-        {kpi("Pertes & péremptions", fmtCurrency(report.lossesTotal), <IconAlert className="text-white" size={20} />, "bg-rose-600", `${report.nbLosses} entrée${report.nbLosses > 1 ? "s" : ""}`, "text-rose-600")}
-        {kpi("Résultat net estimé", fmtCurrency(report.netResult), <IconCurrency className="text-white" size={20} />, report.netResult >= 0 ? "bg-sky-600" : "bg-rose-600", "Bénéf. brut − pertes", report.netResult >= 0 ? "text-emerald-600" : "text-rose-600")}
+      {/* Filtres */}
+      <Card className="p-4 space-y-3">
+        <div className="flex flex-wrap gap-2" role="group" aria-label="Période">
+          {PRESETS.map(p => (
+            <button key={p.id} onClick={() => pickPreset(p.id)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${preset === p.id ? "bg-slate-900 text-white" : "bg-white border border-slate-200 text-slate-700 hover:border-slate-400"}`}>{p.label}</button>
+          ))}
+        </div>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs text-slate-600">
+          <label className="flex flex-col gap-1">Du<input type="date" lang="fr-FR" max={to} className={inputClass + " !py-1.5 !text-xs"} value={from} onChange={e => { if (e.target.value) { setFrom(e.target.value); setPreset(""); } }} /></label>
+          <label className="flex flex-col gap-1">Au<input type="date" lang="fr-FR" min={from} className={inputClass + " !py-1.5 !text-xs"} value={to} onChange={e => { if (e.target.value) { setTo(e.target.value); setPreset(""); } }} /></label>
+          <label className="flex flex-col gap-1">Type d'inventaire
+            <select className={inputClass + " !py-1.5 !text-xs"} value={typeFilter} onChange={e => setTypeFilter(e.target.value as typeof typeFilter)}>
+              <option value="all">Tous</option><option value="Semaine">Hebdomadaire</option><option value="Mois">Mensuel</option>
+            </select></label>
+          <label className="flex flex-col gap-1">Catégorie
+            <select className={inputClass + " !py-1.5 !text-xs"} value={category} onChange={e => setCategory(e.target.value)}>
+              <option value="">Toutes les catégories</option>
+              {categories.map(c => <option key={c} value={c}>{c}</option>)}
+            </select></label>
+        </div>
+        <p className="text-[11px] text-slate-500">
+          {fmtDate(from)} → {fmtDate(to)} ({periodDays} jour{periodDays > 1 ? "s" : ""}) · comparé à {fmtDate(prevFrom)} → {fmtDate(prevTo)} · Stock à ce jour, écarts valorisés au prix d'achat HT actuel.
+        </p>
+      </Card>
+
+      {/* Indicateurs */}
+      <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
+        {kpi("Valeur du stock (achat)", fmtCurrency(k.stockCost), `${k.refs} référence${k.refs > 1 ? "s" : ""} · ${fmtQty(k.units)} unités`)}
+        {kpi("Valeur du stock (vente)", fmtCurrency(k.stockSale), `marge potentielle ${fmtCurrency(k.stockSale - k.stockCost)}`)}
+        {kpi("Alertes de stock", String(k.low + k.out), `${k.out} en rupture · ${k.low} sous le seuil`, undefined, k.low + k.out > 0 ? "text-orange-600" : "text-slate-900")}
+        {kpi("Pertes & péremptions", fmtCurrency(k.lossCur.total), `${k.lossCur.count} déclaration${k.lossCur.count > 1 ? "s" : ""}`, <Delta v={k.lossDelta} invert />)}
+        {kpi("Inventaires réalisés", String(k.cur.count), lastSession ? `dernier le ${fmtDate(lastSession.date)}` : "aucun sur la période")}
+        {kpi("Taux d'exactitude", k.cur.accuracy === null ? "—" : pct(k.cur.accuracy), `${fmtQty(k.cur.lines - k.cur.withDiff)} / ${fmtQty(k.cur.lines)} lignes justes`, <Delta v={k.accuracyDelta} suffix=" pts" />)}
+        {kpi("Manquants", fmtCurrency(k.cur.missing), "valeur des quantités manquantes", <Delta v={k.missingDelta} invert />, k.cur.missing > 0 ? "text-rose-600" : "text-slate-900")}
+        {kpi("Écart net", signedMoney(k.cur.extra - k.cur.missing), `excédents ${fmtCurrency(k.cur.extra)}`, undefined, k.cur.extra - k.cur.missing < 0 ? "text-rose-600" : k.cur.extra - k.cur.missing > 0 ? "text-emerald-700" : "text-slate-900")}
       </div>
 
-      {/* KPIs opérationnels */}
-      <div className="grid grid-cols-2 xl:grid-cols-4 gap-3">
-        {kpi("Panier moyen", fmtCurrency(report.avgBasket), <IconCart className="text-white" size={20} />, "bg-indigo-600", `${report.itemsSold} article${report.itemsSold > 1 ? "s" : ""} vendus`)}
-        {kpi("Achats fournisseurs", fmtCurrency(report.purchasesTotal), <IconBox className="text-white" size={20} />, "bg-amber-600", `${report.nbPurchases} commande${report.nbPurchases > 1 ? "s" : ""}`)}
-        {kpi("Valeur du stock", fmtCurrency(report.stockValueCost), <IconClipboard className="text-white" size={20} />, "bg-teal-600", `${fmtCurrency(report.stockValueSale)} en vente`)}
-        {kpi("Alertes stock", `${report.lowStock}`, <IconAlert className="text-white" size={20} />, "bg-orange-500", `${report.outStock} en rupture`, report.lowStock > 0 ? "text-orange-600" : "text-slate-500")}
-      </div>
+      {/* Écarts par inventaire */}
+      <Card className="p-4 sm:p-5">
+        <h3 className="font-bold text-slate-900 mb-3">Écarts par inventaire</h3>
+        {chartSessions.length === 0
+          ? <EmptyState title="Aucun inventaire sur cette période" subtitle="Lancez un comptage ou choisissez une autre période" />
+          : <DiscrepancyChart sessions={chartSessions} />}
+      </Card>
 
-      {/* Analyses détaillées */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Top produits */}
-        <Card className="p-5 lg:col-span-2">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="font-bold text-slate-900">Top produits vendus</h3>
-            <Badge tone="sky">{PERIOD_LABEL[period]}</Badge>
-          </div>
-          {report.topProducts.length === 0 ? (
-            <p className="text-slate-500 text-sm py-6 text-center">Aucune vente sur la période.</p>
-          ) : (
-            <div className="space-y-3">
-              {report.topProducts.map((p, i) => {
-                const max = report.topProducts[0].total;
-                const pct = max > 0 ? Math.round((p.total / max) * 100) : 0;
-                return (
-                  <div key={p.name}>
-                    <div className="flex items-center justify-between text-sm gap-2">
-                      <span className="font-semibold text-slate-800 truncate">{i + 1}. {p.name}</span>
-                      <span className="text-slate-600 whitespace-nowrap text-xs sm:text-sm">{p.qty} vendu(s) · <b>{fmtCurrency(p.total)}</b></span>
-                    </div>
-                    <div className="h-2 bg-slate-100 rounded-full overflow-hidden mt-1.5">
-                      <div className="h-full bg-slate-900 rounded-full transition-all duration-500" style={{ width: `${pct}%` }} />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </Card>
-
-        {/* Modes de paiement + meilleurs clients */}
-        <Card className="p-5">
-          <h3 className="font-bold text-slate-900 mb-4">Modes de paiement</h3>
-          {report.payments.length === 0 ? (
-            <p className="text-slate-500 text-sm py-2 text-center">Aucune donnée.</p>
-          ) : (
-            <div className="space-y-2">
-              {report.payments.map(p => {
-                const pct = report.revenue > 0 ? Math.round((p.total / report.revenue) * 100) : 0;
-                return (
-                  <div key={p.method} className="flex items-center justify-between p-2.5 rounded-xl bg-slate-50">
-                    <span className="text-sm font-medium text-slate-800">{p.method}</span>
-                    <span className="text-xs text-slate-500">{pct}% · <b className="text-slate-900">{fmtCurrency(p.total)}</b></span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-
-          {report.topCustomers.length > 0 && (
-            <>
-              <h3 className="font-bold text-slate-900 mt-5 mb-3">Meilleurs clients</h3>
-              <div className="space-y-2">
-                {report.topCustomers.map((c, i) => (
-                  <div key={c.name} className="flex items-center justify-between p-2.5 rounded-xl bg-slate-50">
-                    <span className="text-sm font-medium text-slate-800 truncate">{i + 1}. {c.name}</span>
-                    <b className="text-xs text-slate-900 whitespace-nowrap">{fmtCurrency(c.total)}</b>
-                  </div>
-                ))}
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+        <Card className="p-4 sm:p-5">
+          <h3 className="font-bold text-slate-900 mb-1">Valeur du stock par catégorie</h3>
+          <p className="text-[11px] text-slate-500 mb-3">Valorisé au prix d'achat HT · stock actuel</p>
+          <div className="space-y-3">
+            {byCategory.map(c => (
+              <div key={c.name}>
+                <div className="flex items-center justify-between gap-2 text-sm">
+                  <span className="font-semibold text-slate-900 truncate">{c.name}</span>
+                  <span className="text-xs text-slate-600 whitespace-nowrap">{fmtCurrency(c.cost)} · <b>{pct(c.share)}</b></span>
+                </div>
+                <div className="h-3 rounded bg-slate-100 mt-1 overflow-hidden">
+                  <div className="h-full rounded bg-slate-700" style={{ width: `${Math.max(2, (c.cost / maxCatCost) * 100)}%` }} />
+                </div>
+                <div className="flex items-center justify-between text-[11px] text-slate-500 mt-0.5">
+                  <span>{c.refs} réf. · {fmtQty(c.units)} unités · {fmtCurrency(c.sale)} en vente</span>
+                  {c.low > 0 && <Badge tone="amber">{c.low} en alerte</Badge>}
+                </div>
               </div>
-            </>
+            ))}
+            {byCategory.length === 0 && <p className="text-sm text-slate-500">Aucun produit</p>}
+          </div>
+        </Card>
+
+        <Card className="p-4 sm:p-5">
+          <h3 className="font-bold text-slate-900 mb-1">Produits les plus en écart</h3>
+          <p className="text-[11px] text-slate-500 mb-3">Cumul des inventaires de la période</p>
+          {topDiscrepancies.length === 0 ? <p className="text-sm text-slate-500">Aucun écart constaté sur la période.</p> : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead><tr className="text-left text-[11px] uppercase text-slate-500 border-b border-slate-200">
+                  <th className="py-2 pr-2">Produit</th><th className="py-2 px-2 text-right">Fois</th><th className="py-2 px-2 text-right">Écart</th><th className="py-2 pl-2 text-right">Valeur</th>
+                </tr></thead>
+                <tbody>
+                  {topDiscrepancies.map((p, i) => (
+                    <tr key={p.name + i} className="border-b border-slate-100 last:border-0">
+                      <td className="py-2 pr-2"><span className="text-slate-400 text-xs mr-1.5">{i + 1}.</span><span className="font-medium">{p.name}</span></td>
+                      <td className="py-2 px-2 text-right text-slate-600">{p.times}</td>
+                      <td className={`py-2 px-2 text-right font-semibold ${p.qty < 0 ? "text-rose-600" : p.qty > 0 ? "text-emerald-700" : ""}`}>{p.qty > 0 ? "+" : ""}{fmtQty(p.qty)} <span className="text-[10px] text-slate-400">{p.unit}</span></td>
+                      <td className={`py-2 pl-2 text-right whitespace-nowrap ${p.value < 0 ? "text-rose-600" : "text-emerald-700"}`}>{signedMoney(p.value)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </Card>
       </div>
 
-      {/* Section inventaire physique */}
-      <div>
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
-          <div className="min-w-0">
-            <h3 className="font-bold text-slate-900">Inventaire physique</h3>
-            <p className="text-slate-500 text-xs mt-0.5">{inventory.length} comptage{inventory.length > 1 ? "s" : ""} enregistré{inventory.length > 1 ? "s" : ""} · {products.length} articles à compter</p>
-          </div>
-          <div className="flex items-center gap-2 w-full sm:w-auto">
-            <SearchSelect className="flex-1 sm:w-32" value={countPeriod} onChange={v => setCountPeriod(v as "Semaine" | "Mois")}
-              options={[
-                { value: "Semaine", label: "Semaine" },
-                { value: "Mois", label: "Mois" },
-              ]} />
-            <Button onClick={startInventory} className="flex-1 sm:flex-none whitespace-nowrap"><IconPlus size={16} /> Compter</Button>
-          </div>
+      {/* Historique */}
+      <Card className="p-4 sm:p-5">
+        <div className="flex items-center justify-between gap-2 mb-3">
+          <h3 className="font-bold text-slate-900">Historique des inventaires</h3>
+          <Badge tone="sky">{current.length} sur la période</Badge>
         </div>
-
-        {/* Desktop table */}
-        <Card className="p-5 hidden md:block">
+        {current.length === 0 ? <EmptyState title="Aucun inventaire" subtitle="Lancez votre premier comptage" /> : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
-              <thead className="bg-slate-50">
-                <tr className="text-left text-slate-600 uppercase text-xs border-b border-slate-200">
-                  <th className="py-3 px-4">Date</th>
-                  <th className="py-3 px-4">Période</th>
-                  <th className="py-3 px-4">Produit</th>
-                  <th className="py-3 px-4 text-right">Théorique</th>
-                  <th className="py-3 px-4 text-right">Réel</th>
-                  <th className="py-3 px-4 text-right">Écart</th>
-                </tr>
-              </thead>
+              <thead><tr className="text-left text-[11px] uppercase text-slate-500 border-b border-slate-200">
+                <th className="py-2 pr-2">Date</th><th className="py-2 px-2">Type</th><th className="py-2 px-2 hidden xl:table-cell">Réalisé par</th>
+                <th className="py-2 px-2 text-right">Articles</th><th className="py-2 px-2 text-right">Écarts</th>
+                <th className="py-2 px-2 text-right hidden lg:table-cell">Exactitude</th><th className="py-2 px-2 text-right">Écart net</th><th className="py-2 pl-2 text-right">Fiche</th>
+              </tr></thead>
               <tbody>
-                {inventory.map(i => (
-                  <tr key={i.id} className="border-b border-slate-100 last:border-0">
-                    <td className="py-3 px-4 text-slate-600">{fmtDate(i.date)}</td>
-                    <td className="py-3 px-4"><Badge tone="sky">{i.period}</Badge></td>
-                    <td className="py-3 px-4 font-semibold">{i.productName}</td>
-                    <td className="py-3 px-4 text-right">{i.expected}</td>
-                    <td className="py-3 px-4 text-right">{i.actual}</td>
-                    <td className={`py-3 px-4 text-right font-bold ${i.difference < 0 ? "text-rose-600" : i.difference > 0 ? "text-emerald-600" : "text-slate-700"}`}>{i.difference >= 0 ? "+" : ""}{i.difference}</td>
+                {current.map(s => (
+                  <tr key={s.id} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 cursor-pointer" onClick={() => setDetail(s)}>
+                    <td className="py-2 pr-2 font-medium whitespace-nowrap">{fmtDate(s.date)}</td>
+                    <td className="py-2 px-2"><Badge tone="sky">{s.period === "Mois" ? "Mensuel" : "Hebdo"}</Badge></td>
+                    <td className="py-2 px-2 text-slate-600 hidden xl:table-cell">{s.userName || "—"}</td>
+                    <td className="py-2 px-2 text-right text-slate-600">{s.lines.length}</td>
+                    <td className="py-2 px-2 text-right">{s.withDiff > 0 ? <b className="text-rose-600">{s.withDiff}</b> : <span className="text-slate-400">0</span>}</td>
+                    <td className="py-2 px-2 text-right hidden lg:table-cell">{pct(s.accuracy)}</td>
+                    <td className={`py-2 px-2 text-right whitespace-nowrap font-semibold ${s.net < 0 ? "text-rose-600" : s.net > 0 ? "text-emerald-700" : "text-slate-500"}`}>{signedMoney(s.net)}</td>
+                    <td className="py-2 pl-2 text-right">
+                      <button onClick={e => { e.stopPropagation(); printSession(s); }} className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-slate-200 text-xs font-semibold text-slate-700 hover:border-slate-400" title="Imprimer la fiche d'inventaire">
+                        <IconPrinter size={13} /> <span className="hidden 2xl:inline">Imprimer</span>
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
-          {inventory.length === 0 && <EmptyState title="Aucun inventaire" subtitle="Lancez votre premier comptage" />}
-        </Card>
+        )}
+      </Card>
 
-        {/* Mobile cards */}
-        <div className="md:hidden space-y-3">
-          {inventory.length === 0 && <Card className="p-6"><EmptyState title="Aucun inventaire" subtitle="Lancez votre premier comptage" /></Card>}
-          {inventory.map(i => (
-            <Card key={i.id} className="p-4">
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="font-bold text-slate-900 truncate">{i.productName}</div>
-                  <div className="text-xs text-slate-500 mt-0.5">{fmtDate(i.date)}</div>
-                </div>
-                <Badge tone="sky">{i.period}</Badge>
+      {/* Détail d'un inventaire */}
+      <Modal open={!!detail} onClose={() => setDetail(null)} size="lg"
+        title={detail ? `Inventaire ${detail.period === "Mois" ? "mensuel" : "hebdomadaire"} du ${fmtDate(detail.date)}` : ""}
+        footer={detail && (
+          <div className="flex flex-wrap justify-end gap-2">
+            <Button variant="ghost" onClick={() => setDetail(null)}>Fermer</Button>
+            <Button variant="outline" onClick={() => printSession(detail, true)}><IconPrinter size={15} /> Écarts seulement</Button>
+            <Button onClick={() => printSession(detail)}><IconPrinter size={15} /> Imprimer la fiche</Button>
+          </div>
+        )}>
+        {detail && (<>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
+            {[
+              ["Réalisé par", detail.userName || "—", ""],
+              ["Articles avec écart", `${detail.withDiff} / ${detail.lines.length}`, detail.withDiff ? "text-rose-600" : ""],
+              ["Exactitude", pct(detail.accuracy), ""],
+              ["Écart net", signedMoney(detail.net), detail.net < 0 ? "text-rose-600" : detail.net > 0 ? "text-emerald-700" : ""],
+            ].map(([l, v, tone]) => (
+              <div key={l} className="rounded-xl bg-slate-50 p-3">
+                <div className="text-[10px] uppercase font-semibold text-slate-500">{l}</div>
+                <div className={`font-black text-slate-900 truncate ${tone}`}>{v}</div>
               </div>
-              <div className="grid grid-cols-3 gap-2 mt-3 text-center">
-                <div className="rounded-lg bg-slate-50 py-2">
-                  <div className="text-[10px] uppercase text-slate-500 font-semibold">Théorique</div>
-                  <div className="font-bold text-slate-900">{i.expected}</div>
-                </div>
-                <div className="rounded-lg bg-slate-50 py-2">
-                  <div className="text-[10px] uppercase text-slate-500 font-semibold">Réel</div>
-                  <div className="font-bold text-slate-900">{i.actual}</div>
-                </div>
-                <div className={`rounded-lg py-2 ${i.difference < 0 ? "bg-rose-50" : i.difference > 0 ? "bg-emerald-50" : "bg-slate-50"}`}>
-                  <div className="text-[10px] uppercase text-slate-500 font-semibold">Écart</div>
-                  <div className={`font-bold ${i.difference < 0 ? "text-rose-600" : i.difference > 0 ? "text-emerald-600" : "text-slate-700"}`}>{i.difference >= 0 ? "+" : ""}{i.difference}</div>
-                </div>
-              </div>
-            </Card>
-          ))}
+            ))}
+          </div>
+          <div className="max-h-[50vh] overflow-y-auto">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-white"><tr className="text-left text-[11px] uppercase text-slate-500 border-b border-slate-200">
+                <th className="py-2 pr-2">Produit</th><th className="py-2 px-2 text-right">Théorique</th><th className="py-2 px-2 text-right">Compté</th><th className="py-2 pl-2 text-right">Écart</th>
+              </tr></thead>
+              <tbody>
+                {[...detail.lines].sort((a, b) => Math.abs(b.difference * b.cost) - Math.abs(a.difference * a.cost)).map(l => (
+                  <tr key={l.id} className="border-b border-slate-100 last:border-0">
+                    <td className="py-2 pr-2"><div className="font-medium">{l.productName}</div><div className="text-[11px] text-slate-500">{l.category || "—"}</div></td>
+                    <td className="py-2 px-2 text-right text-slate-600">{fmtQty(l.expected)}</td>
+                    <td className="py-2 px-2 text-right">{fmtQty(l.actual)}</td>
+                    <td className={`py-2 pl-2 text-right font-bold ${l.difference < 0 ? "text-rose-600" : l.difference > 0 ? "text-emerald-700" : "text-slate-400"}`}>{l.difference > 0 ? "+" : ""}{fmtQty(l.difference)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>)}
+      </Modal>
+
+      {/* Options de la fiche de comptage vierge */}
+      <Modal open={sheetOpen} onClose={() => setSheetOpen(false)} title="Imprimer une fiche de comptage"
+        footer={<div className="flex justify-end gap-2"><Button variant="ghost" onClick={() => setSheetOpen(false)}>Annuler</Button><Button onClick={printCountSheet}><IconPrinter size={15} /> Imprimer</Button></div>}>
+        <div className="space-y-3 text-sm">
+          <p className="text-slate-600">Fiche A4 à remplir à la main pendant le comptage, regroupée par catégorie, avec cases de saisie et signatures.</p>
+          <label className="flex flex-col gap-1 text-xs text-slate-600">Type d'inventaire
+            <select className={inputClass} value={sheetType} onChange={e => setSheetType(e.target.value as CountType)}>
+              <option value="Semaine">Hebdomadaire</option><option value="Mois">Mensuel</option>
+            </select></label>
+          <label className="flex flex-col gap-1 text-xs text-slate-600">Catégorie
+            <select className={inputClass} value={sheetCategory} onChange={e => setSheetCategory(e.target.value)}>
+              <option value="">Toutes les catégories ({products.length} articles)</option>
+              {categories.map(c => <option key={c} value={c}>{c} ({products.filter(p => p.category === c).length})</option>)}
+            </select></label>
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input type="checkbox" className="mt-0.5" checked={sheetShowExpected} onChange={e => setSheetShowExpected(e.target.checked)} />
+            <span>Afficher le stock théorique<span className="block text-[11px] text-slate-500">Décoché (recommandé) : comptage « à l'aveugle », l'employé ne voit pas la quantité attendue.</span></span>
+          </label>
         </div>
-      </div>
+      </Modal>
 
-      {/* Modal comptage */}
-      <Modal
-        open={open}
-        onClose={() => setOpen(false)}
-        title={`Comptage ${countPeriod.toLowerCase()}`}
-        size="lg"
+      {/* Saisie du comptage */}
+      <Modal open={open} onClose={() => setOpen(false)} title={`Comptage ${countType === "Mois" ? "mensuel" : "hebdomadaire"}`} size="lg"
         footer={
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="text-xs sm:text-sm text-slate-600">Écart valeur : <b className={countSummary.diff < 0 ? "text-rose-600" : "text-emerald-700"}>{countSummary.diff >= 0 ? "+" : ""}{fmtCurrency(countSummary.diff)}</b></div>
+            <div className="text-xs sm:text-sm text-slate-600">{countSummary.withDiff} écart{countSummary.withDiff > 1 ? "s" : ""} · valeur <b className={countSummary.diff < 0 ? "text-rose-600" : "text-emerald-700"}>{signedMoney(countSummary.diff)}</b></div>
             <div className="flex gap-2 flex-wrap">
               <Button variant="ghost" onClick={() => setOpen(false)} className="flex-1 sm:flex-none">Annuler</Button>
-              <Button variant="outline" onClick={exportInventorySheetPDF} className="flex-1 sm:flex-none"><IconDownload size={15} /> Imprimer PDF</Button>
+              <Button variant="outline" className="flex-1 sm:flex-none"
+                onClick={() => printHtml(buildResultSheet({ ss, period: countType, date: iso(new Date()), lines: countLines(), draft: true, userName: currentUser?.name }), "Fiche d'inventaire")}>
+                <IconPrinter size={15} /> Imprimer
+              </Button>
               <Button variant="success" onClick={saveInventory} className="flex-1 sm:flex-none">Valider</Button>
             </div>
           </div>
-        }
-      >
-        <div className="grid grid-cols-3 gap-2 sm:gap-3 mb-4">
-          <Card className="p-3 bg-slate-50">
-            <div className="text-[10px] sm:text-xs text-slate-500 font-semibold uppercase">Articles</div>
-            <div className="text-base sm:text-lg font-black">{filteredProducts.length}</div>
-          </Card>
-          <Card className="p-3 bg-slate-50">
-            <div className="text-[10px] sm:text-xs text-slate-500 font-semibold uppercase">Théo. / Réel</div>
-            <div className="text-base sm:text-lg font-black">{expected}/{actual}</div>
-          </Card>
-          <Card className="p-3 bg-slate-50">
-            <div className="text-[10px] sm:text-xs text-slate-500 font-semibold uppercase">Valeur réelle</div>
-            <div className="text-sm sm:text-lg font-black truncate">{fmtCurrency(countSummary.totalActual)}</div>
-          </Card>
+        }>
+        <div className="grid grid-cols-2 gap-2 mb-3">
+          <label className="flex flex-col gap-1 text-xs text-slate-600">Type
+            <select className={inputClass + " !py-1.5"} value={countType} onChange={e => setCountType(e.target.value as CountType)}>
+              <option value="Semaine">Hebdomadaire</option><option value="Mois">Mensuel</option>
+            </select></label>
+          <div className="rounded-xl bg-slate-50 p-2.5">
+            <div className="text-[10px] uppercase font-semibold text-slate-500">Valeur comptée</div>
+            <div className="font-black truncate">{fmtCurrency(countSummary.totalActual)}</div>
+          </div>
         </div>
 
         <div className="relative mb-3">
@@ -591,12 +544,10 @@ export default function Inventory() {
         </div>
 
         <div className="space-y-2.5 max-h-[45vh] overflow-y-auto pr-1 -mr-1">
-          {filteredProducts.length === 0 && (
-            <p className="text-center text-slate-500 text-sm py-8">Aucun produit trouvé.</p>
-          )}
-          {filteredProducts.map(p => {
+          {filteredProducts.length === 0 && <p className="text-center text-slate-500 text-sm py-8">Aucun produit trouvé.</p>}
+          {filteredProducts.map((p: Product) => {
             const val = counts[p.id] ?? p.stock;
-            const diff = val - p.stock;
+            const diff = Math.round((val - p.stock) * 1000) / 1000;
             const step = (d: number) => setCounts(c => ({ ...c, [p.id]: Math.max(0, (c[p.id] ?? p.stock) + d) }));
             return (
               <div key={p.id} className="p-3 rounded-xl bg-slate-50 border border-slate-200">
@@ -607,29 +558,19 @@ export default function Inventory() {
                   </div>
                   <div className="text-right flex-shrink-0">
                     <div className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold">Théorique</div>
-                    <div className="text-sm font-bold text-slate-700">{p.stock} {p.unit}</div>
+                    <div className="text-sm font-bold text-slate-700">{fmtQty(p.stock)} {p.unit}</div>
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-[11px] text-slate-500 font-medium flex-shrink-0">Compté :</span>
                   <div className="flex items-center gap-1 flex-1">
-                    <button onClick={() => step(-1)} className="w-8 h-8 rounded-lg bg-white border border-slate-300 flex items-center justify-center text-slate-600 hover:bg-slate-100 active:scale-95 transition flex-shrink-0">
-                      <IconMinus size={13} />
-                    </button>
-                    <input
-                      type="number"
-                      className={inputClass + " !py-1.5 text-center flex-1 min-w-0 font-bold"}
-                      value={val}
-                      onChange={e => setCounts(c => ({ ...c, [p.id]: +e.target.value }))}
-                    />
-                    <button onClick={() => step(1)} className="w-8 h-8 rounded-lg bg-slate-900 text-white flex items-center justify-center hover:bg-slate-800 active:scale-95 transition flex-shrink-0">
-                      <IconPlus size={13} />
-                    </button>
+                    <button onClick={() => step(-1)} aria-label="Retirer 1" className="w-8 h-8 rounded-lg bg-white border border-slate-300 flex items-center justify-center text-slate-600 hover:bg-slate-100 active:scale-95 transition flex-shrink-0"><IconMinus size={13} /></button>
+                    <input type="number" min={0} step="any" className={inputClass + " !py-1.5 text-center flex-1 min-w-0 font-bold"} value={val}
+                      onChange={e => { const v = parseFloat(e.target.value); setCounts(c => ({ ...c, [p.id]: isNaN(v) ? 0 : Math.max(0, v) })); }} />
+                    <button onClick={() => step(1)} aria-label="Ajouter 1" className="w-8 h-8 rounded-lg bg-slate-900 text-white flex items-center justify-center hover:bg-slate-800 active:scale-95 transition flex-shrink-0"><IconPlus size={13} /></button>
                   </div>
-                  <div className={`flex-shrink-0 min-w-[54px] text-center text-xs font-bold px-2 py-1 rounded-lg ${
-                    diff < 0 ? "bg-rose-100 text-rose-700" : diff > 0 ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-500"
-                  }`}>
-                    {diff >= 0 ? "+" : ""}{diff}
+                  <div className={`flex-shrink-0 min-w-[54px] text-center text-xs font-bold px-2 py-1 rounded-lg ${diff < 0 ? "bg-rose-100 text-rose-700" : diff > 0 ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>
+                    {diff > 0 ? "+" : ""}{fmtQty(diff)}
                   </div>
                 </div>
               </div>
@@ -638,12 +579,12 @@ export default function Inventory() {
         </div>
       </Modal>
 
-      <Modal open={confirmOpen} onClose={() => setConfirmOpen(false)} title="Inventaire validé">
-        <p className="text-sm text-slate-600">L'inventaire a été enregistré et les stocks ajustés automatiquement.</p>
+      {/* Confirmation après validation */}
+      <Modal open={!!lastSaved} onClose={() => setLastSaved(null)} title="Inventaire validé">
+        <p className="text-sm text-slate-600">L'inventaire a été enregistré et les stocks ajustés sur les quantités comptées.</p>
         <div className="flex flex-wrap justify-end gap-2 mt-4">
-          <Button variant="outline" onClick={() => window.print()}><IconPrinter size={16} /> Imprimer</Button>
-          <Button onClick={exportReportPDF}><IconDownload size={16} /> Rapport PDF</Button>
-          <Button variant="ghost" onClick={() => setConfirmOpen(false)}>Fermer</Button>
+          <Button variant="ghost" onClick={() => setLastSaved(null)}>Fermer</Button>
+          <Button onClick={() => { if (lastSaved) printHtml(buildResultSheet({ ss, ...lastSaved, userName: currentUser?.name }), "Fiche d'inventaire"); }}><IconPrinter size={16} /> Imprimer la fiche</Button>
         </div>
       </Modal>
     </div>

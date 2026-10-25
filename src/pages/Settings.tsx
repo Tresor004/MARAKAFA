@@ -3,6 +3,8 @@ import { useStore } from "../store";
 import { ShopSettings } from "../types";
 import { Card, Button, Field, inputClass, SearchSelect } from "../components/ui";
 import { useToast } from "../components/ui";
+import { LOCAL_MODE } from "../api";
+import LocalDataCard from "../components/LocalDataCard";
 import { IconCamera, IconCheck, IconTrash, IconStore, IconMapPin, IconFileText, IconReceipt, IconPalette, IconPhone, IconMail, IconTag, IconCoin, IconLightbulb, IconClipboard } from "../components/Icons";
 
 const SHOP_TYPES = [
@@ -23,7 +25,7 @@ const CURRENCIES = [
   { code: "NGN", symbol: "₦", label: "Naira" },
 ];
 
-type Section = "identity" | "contact" | "legal" | "invoicing" | "appearance";
+type Section = "identity" | "contact" | "legal" | "invoicing" | "rules" | "appearance";
 
 export default function Settings() {
   const { shopSettings, updateShopSettings } = useStore();
@@ -38,8 +40,8 @@ export default function Settings() {
     setHasChanges(true);
   };
 
-  const save = () => {
-    updateShopSettings(form);
+  const save = async () => {
+    if (!(await updateShopSettings(form))) return;   // erreur déjà affichée
     setHasChanges(false);
     push("Paramètres enregistrés avec succès !");
   };
@@ -70,6 +72,7 @@ export default function Settings() {
     { key: "contact", label: "Contact & Localisation", icon: <IconMapPin size={16} /> },
     { key: "legal", label: "Informations légales", icon: <IconFileText size={16} /> },
     { key: "invoicing", label: "Facturation", icon: <IconReceipt size={16} /> },
+    { key: "rules", label: "Règles de vente", icon: <IconCoin size={16} /> },
     { key: "appearance", label: "Personnalisation", icon: <IconPalette size={16} /> },
   ];
 
@@ -277,6 +280,31 @@ export default function Settings() {
           </div>
         )}
 
+        {/* SALES RULES */}
+        {section === "rules" && (
+          <div className="space-y-6 animate-[fadeIn_.2s_ease-out]">
+            <div>
+              <h2 className="text-lg font-black text-slate-900 mb-1 flex items-center gap-2"><IconCoin size={20} /> Règles de vente</h2>
+              <p className="text-sm text-slate-500">Contrôles appliqués en caisse. Ils sont vérifiés par le serveur, pas seulement à l'écran.</p>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <Field label="Remise manuelle maximale d'un caissier (%)" hint="L'administrateur n'est pas limité. 0 = les caissiers ne peuvent accorder aucune remise manuelle (les promotions restent appliquées).">
+                <input type="number" min="0" max="100" step="any" className={inputClass} value={form.maxDiscountPercent} onChange={e => set("maxDiscountPercent", Math.min(100, Math.max(0, +e.target.value || 0)))} />
+              </Field>
+            </div>
+            <label className="flex items-start gap-3 p-4 rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-50">
+              <input type="checkbox" className="mt-1" checked={form.allowCredit} onChange={e => set("allowCredit", e.target.checked)} />
+              <span><b className="text-sm text-slate-900">Autoriser les ventes à crédit et les paiements partiels</b>
+                <span className="block text-xs text-slate-500 mt-0.5">Un client identifié peut repartir en laissant un solde, qui devient une créance à encaisser plus tard (plafond réglable par client).</span></span>
+            </label>
+            <label className="flex items-start gap-3 p-4 rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-50">
+              <input type="checkbox" className="mt-1" checked={form.requireCashSession} onChange={e => set("requireCashSession", e.target.checked)} />
+              <span><b className="text-sm text-slate-900">Exiger l'ouverture de la caisse avant de vendre</b>
+                <span className="block text-xs text-slate-500 mt-0.5">Chaque caissier ouvre sa caisse avec un fond de caisse, puis la ferme en comptant les espèces ; un écart prévient l'administrateur.</span></span>
+            </label>
+          </div>
+        )}
+
         {/* APPEARANCE */}
         {section === "appearance" && (
           <div className="space-y-6 animate-[fadeIn_.2s_ease-out]">
@@ -330,6 +358,8 @@ export default function Settings() {
           </div>
         )}
       </Card>
+
+      {LOCAL_MODE && <LocalDataCard />}
 
       {/* Sticky save bar on mobile when there are changes */}
       {hasChanges && (

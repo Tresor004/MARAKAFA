@@ -2,112 +2,62 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Support\Present;
 use App\Models\Customer;
 use App\Models\Loss;
 use App\Models\Product;
 use App\Models\Purchase;
 use App\Models\Sale;
+use App\Models\SaleItem;
 use App\Models\Supplier;
-use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
 class DashboardController extends Controller
 {
-    /**
-     * GET /api/dashboard
-     * Retourne tous les KPIs pour le tableau de bord.
-     */
+    /** Indicateurs agrégés côté base (aucune liste complète n'est transférée). */
     public function index(Request $request): JsonResponse
     {
-        $date = $request->get('date', today()->toDateString());
+        $d = $request->validate(['date' => ['nullable', 'date_format:Y-m-d']]);
+        $date = $d['date'] ?? today()->toDateString();
+        $weekAgo = today()->subDays(7)->toDateString();
 
-        // ── Chiffre d'affaires ─────────────────────────────────────────────
-        $totalRevenue = Sale::sum('total');
+        $day = Sale::whereDate('sale_date', $date);
+        $week = Sale::whereDate('sale_date', '>=', $weekAgo);
 
-        $dateRevenue = Sale::whereDate('sale_date', $date)->sum('total');
-        $dateSalesCount = Sale::whereDate('sale_date', $date)->count();
+        $top = SaleItem::query()
+            ->select('product_name', DB::raw('SUM(quantity - returned_quantity) as qty'), DB::raw('SUM(total * (quantity - returned_quantity) / quantity) as total'))
+            ->groupBy('product_name')->orderByDesc('total')->limit(5)->get()
+            ->map(fn ($r) => ['name' => $r->product_name, 'qty' => (float) $r->qty, 'total' => (float) $r->total])->values();
 
-        // ── Ventes 7 derniers jours ─────────────────────────────────────────
-        $weekRevenue = Sale::where('sale_date', '>=', now()->subDays(7)->toDateString())->sum('total');
-        $weekSalesCount = Sale::where('sale_date', '>=', now()->subDays(7)->toDateString())->count();
+        $today = today();
+        $expiring = Product::whereNotNull('expiry_date')
+            ->whereDate('expiry_date', '<=', $today->copy()->addDays(15))
+            ->whereDate('expiry_date', '>=', $today->copy()->subDays(30))->count();
 
-        // ── Achats ─────────────────────────────────────────────────────────
-        $totalPurchases = Purchase::sum('total');
-        $purchasesCount = Purchase::count();
-
-        // ── Stock ──────────────────────────────────────────────────────────
-        $stockValueCost = Product::selectRaw('SUM(stock * cost) as val')->value('val') ?? 0;
-        $lowStockCount  = Product::whereRaw('stock <= min_stock')->where('stock', '>', 0)->count();
-        $outStockCount  = Product::where('stock', 0)->count();
-        $expiringCount  = Product::whereDate('expiry_date', '<=', now()->addDays(15))
-                                  ->whereDate('expiry_date', '>=', today())->count();
-
-        // ── Top produits ───────────────────────────────────────────────────
-        $topProducts = DB::table('sale_items')
-            ->join('products', 'sale_items.product_id', '=', 'products.id')
-            ->select(
-                'sale_items.product_id',
-                'sale_items.product_name',
-                DB::raw('SUM(sale_items.quantity) as qty'),
-                DB::raw('SUM(sale_items.total) as revenue'),
-                DB::raw('SUM((sale_items.unit_price - products.cost) * sale_items.quantity) as profit'),
-            )
-            ->groupBy('sale_items.product_id', 'sale_items.product_name')
-            ->orderByDesc('revenue')
-            ->limit(5)
-            ->get();
-
-        // ── Modes de paiement ──────────────────────────────────────────────
-        $paymentMethods = Sale::select('payment_method', DB::raw('COUNT(*) as count'), DB::raw('SUM(total) as total'))
-            ->groupBy('payment_method')
-            ->get();
-
-        // ── Dernières ventes ───────────────────────────────────────────────
-        $latestSales = Sale::with('customer', 'user')
-            ->orderByDesc('sale_date')
-            ->limit(6)
-            ->get()
-            ->map(fn($s) => [
-                'id'           => $s->id,
-                'invoice_no'   => $s->invoice_no,
-                'date'         => $s->sale_date->format('d/m/Y'),
-                'customer'     => $s->customer?->name ?? 'Client passage',
-                'cashier'      => $s->user?->name,
-                'total'        => $s->total,
-                'payment_method' => $s->payment_method,
-            ]);
+        $recent = Sale::with('items', 'customer', 'user', 'returns.items')->orderByDesc('id')->limit(6)->get();
 
         return response()->json([
-            'revenue' => [
-                'total'        => $totalRevenue,
-                'date'         => $dateRevenue,
-                'date_selected'=> $date,
-                'date_count'   => $dateSalesCount,
-                'week'         => $weekRevenue,
-                'week_count'   => $weekSalesCount,
-            ],
-            'purchases' => [
-                'total' => $totalPurchases,
-                'count' => $purchasesCount,
-            ],
-            'stock' => [
-                'value_cost'  => $stockValueCost,
-                'low_count'   => $lowStockCount,
-                'out_count'   => $outStockCount,
-                'expiring'    => $expiringCount,
-            ],
-            'counts' => [
-                'products'  => Product::count(),
-                'customers' => Customer::count(),
-                'suppliers' => Supplier::count(),
-                'users'     => User::count(),
-                'losses'    => Loss::count(),
-            ],
-            'top_products'    => $topProducts,
-            'payment_methods' => $paymentMethods,
-            'latest_sales'    => $latestSales,
+            'date'            => $date,
+            'totalRevenue'    => (float) Sale::sum(DB::raw('total - returned_total')),
+            'salesCount'      => Sale::count(),
+            'dayRevenue'      => (float) (clone $day)->sum(DB::raw('total - returned_total')),
+            'daySalesCount'   => (clone $day)->count(),
+            'weekRevenue'     => (float) (clone $week)->sum(DB::raw('total - returned_total')),
+            'weekSalesCount'  => (clone $week)->count(),
+            'receivables'     => (float) Sale::sum('balance_due'),
+            'debtorsCount'    => Sale::where('balance_due', '>', 0.004)->distinct()->count('customer_id'),
+            'purchasesTotal'  => (float) Purchase::sum('total'),
+            'purchasesCount'  => Purchase::count(),
+            'topProducts'     => $top,
+            'lowStockCount'   => Product::whereColumn('stock', '<=', 'min_stock')->count(),
+            'expiringCount'   => $expiring,
+            'productsCount'   => Product::count(),
+            'customersCount'  => Customer::count(),
+            'suppliersCount'  => Supplier::count(),
+            'lossesCount'     => Loss::count(),
+            'recentSales'     => $recent->map(fn ($s) => Present::sale($s))->values(),
         ]);
     }
 }

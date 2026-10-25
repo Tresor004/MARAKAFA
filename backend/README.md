@@ -1,58 +1,66 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# Hi-Market — API Laravel
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+API REST (Laravel 13, PHP 8.3, Sanctum, SQLite par défaut) de l'application de gestion de commerce Hi-Market.
+Toute la logique métier (stocks, prix, TVA, numérotation, droits, validations) vit ici ; l'interface React n'est qu'un client.
 
-## About Laravel
-
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
-
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
-
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
-
-## Learning Laravel
-
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
-
-In addition, [Laracasts](https://laracasts.com) contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
-
-You can also watch bite-sized lessons with real-world projects on [Laravel Learn](https://laravel.com/learn), where you will be guided through building a Laravel application from scratch while learning PHP fundamentals.
-
-## Agentic Development
-
-Laravel's predictable structure and conventions make it ideal for AI coding agents like Claude Code, Cursor, and GitHub Copilot. Install [Laravel Boost](https://laravel.com/docs/ai) to supercharge your AI workflow:
+## Démarrage
 
 ```bash
-composer require laravel/boost --dev
-
-php artisan boost:install
+composer install
+cp .env.example .env            # Windows : copy .env.example .env
+php artisan key:generate
+php artisan migrate:fresh --seed
+php artisan serve               # http://127.0.0.1:8000
+php artisan test                # 48 tests
 ```
 
-Boost provides your agent 15+ tools and skills that help agents build Laravel applications while following best practices.
+Comptes de démonstration (⚠ à changer / supprimer en production) :
+`admin@himarket.sn / admin123` · `ibrahima@himarket.sn / ibrahima123` (gestionnaire) · `fatou@himarket.sn / fatou123` (caissier).
 
-## Contributing
+## Principes
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+- **Authentification** : `POST /api/login` (identifiant = email, nom ou téléphone) → jeton Bearer (12 h). Un compte désactivé est coupé immédiatement.
+- **Droits** : un rôle = une liste de pages (`dashboard, products, stock, sales, purchases, customers, suppliers, users, losses, inventory, settings, myspace`). Le rôle `admin` a tout. Les droits sont contrôlés **côté serveur** (middleware `permission:`), l'interface ne fait que masquer des menus.
+- **Validation administrateur** : `POST /api/actions` est le point d'entrée unique des opérations sensibles (produits, clients, fournisseurs, employés, achats, pertes, ajustements de stock, inventaire, profil).
+  L'administrateur exécute immédiatement ; tout autre employé crée une demande (`pending_actions`) que l'administrateur approuve (l'action est alors exécutée **au nom du demandeur**) ou refuse (motif notifié).
+- **Ventes** : `POST /api/sales` reçoit uniquement produits + quantités. Prix, coût, totaux, TVA incluse, numéro de facture sont calculés par le serveur ; le stock est décrémenté de façon atomique (refus si insuffisant, aucune vente partielle).
+- **Stock** : décimal (kg, litres…), jamais négatif, modifié uniquement via `StockService`, qui écrit aussi le **journal des mouvements** (`stock_movements` : type, employé, motif, référence, stock avant/après).
+- **Prix** (`PricingService`) : prix catalogue TTC → meilleure promotion applicable (pas de cumul entre promotions) → remise manuelle en % (plafond `max_discount_percent` pour un caissier, illimité pour l'admin) → TVA incluse dans le net (taux du produit, sinon taux de la boutique). Le client n'envoie jamais de prix.
+- **Crédit et règlements** : `paid` absent = payé en totalité ; `paid` < total = paiement partiel / crédit (client obligatoire, option `allow_credit`, plafond `customers.credit_limit`). Invariant : `balance_due = total − returned_total − amount_paid`. Le registre `payments` (vente / règlement / remboursement) alimente la caisse.
+- **Retours** (`action sale.return`) : avoir numéroté `AV-AAAA-NNNN`, la créance est réduite d'abord, le reste est remboursé ; remise en stock au choix ; dernière unité soldée au centime.
+- **Sessions de caisse** : fond de caisse, espèces attendues = fond + encaissements espèces − remboursements espèces ; un écart à la fermeture notifie les administrateurs ; `require_cash_session` bloque les ventes sans caisse ouverte.
+- **Achats** : lignes saisies HT ou TTC (`priceMode`) avec `taxRate` ; le total du bon est TTC, le coût du produit est mis à jour en HT.
+- **Statistiques** : `GET /api/stats` (période, regroupement jour/semaine/mois, comparaison période précédente ou année précédente), montants nets des retours.
+- **Notifications** : état « lu » par employé ; diffusion ciblée par permission. Les produits périmés sont **signalés** (jamais déclarés en perte automatiquement).
+- **Tâches planifiées** : `php artisan shop:daily-checks` (stock critique, péremptions) tous les jours à 06:00 — ajoutez `* * * * * php artisan schedule:run` au cron en production. Les contrôles sont aussi lancés à la première connexion du jour.
 
-## Code of Conduct
+## Routes principales
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+| Méthode | Route | Droit |
+| --- | --- | --- |
+| POST | `/api/login`, `/api/forgot-password` | public |
+| GET | `/api/public/shop` | public (nom/logo pour l'écran de connexion) |
+| GET/POST | `/api/me`, `/api/me/verify-password`, `/api/logout` | connecté |
+| GET | `/api/products`, `/categories`, `/settings`, `/roles`, `/users/online`, `/notifications`, `/pending-actions` | connecté |
+| GET | `/api/customers`, `/suppliers`, `/users`, `/sales`, `/purchases`, `/losses`, `/inventory`, `/dashboard` | selon la page (voir `routes/api.php`) |
+| POST | `/api/sales` | `sales` |
+| GET | `/api/stock-movements` (filtres `productId, type, from, to, q, page, perPage`) | `stock` ou `inventory` |
+| GET | `/api/stats` (`from, to, granularity, compare`) | `dashboard` |
+| GET | `/api/promotions` | connecté (CRUD via `/api/actions`) |
+| GET | `/api/products/next-barcode` (EAN-13 interne unique) | `products` |
+| GET/POST | `/api/cash-sessions/current`, `/api/cash-sessions`, `/api/cash-sessions/{id}/close` | `sales` |
+| GET/POST | `/api/customers/{id}/account`, `/api/customers/{id}/payments` (encaissement d'une créance) | `customers` ou `sales` |
+| POST/PUT/DELETE | `/api/categories` | `products` |
+| PUT | `/api/settings` | `settings` |
+| POST/PUT/DELETE | `/api/roles` | admin |
+| POST | `/api/actions` | connecté (droit vérifié par type d'action) |
+| POST | `/api/pending-actions/{id}/approve` · `/reject` | admin |
 
-## Security Vulnerabilities
+Types d'actions (`kind`) : `product.add|update|delete`, `customer.*`, `supplier.*`, `user.*`, `loss.add|delete`, `stock.adjust`, `inventory.do`, `purchase.add|update|delete`, `profile.update`, `sale.return`, `promotion.add|update|delete`.
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+## Production
 
-## License
-
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+- `APP_ENV=production`, `APP_DEBUG=false`, HTTPS obligatoire, **changer tous les mots de passe de démonstration**.
+- SQLite convient à un seul point de vente ; au-delà (plusieurs caisses simultanées) préférez MySQL/PostgreSQL (`DB_CONNECTION` dans `.env`).
+- Interface hébergée ailleurs que l'API : renseigner `CORS_ALLOWED_ORIGINS`.
+- Sauvegardes : copier `database/database.sqlite` (ou dump SQL) quotidiennement.

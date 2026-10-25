@@ -1,30 +1,43 @@
-# Hi-Market
+# Hi-Market (MARAKAFA) — Gestion de commerce
 
-Application locale de gestion de supermarche : catalogue, stock, ventes, achats, clients, fournisseurs, inventaires et gestion des employes.
+Application complète de gestion de supermarché : caisse, produits, stocks, achats, clients, fournisseurs, pertes, inventaire,
+employés/rôles avec **circuit de validation administrateur**, notifications, tableau de bord, factures et PDF.
 
-## Demarrage local
+Fonctions métier : journal des mouvements de stock · retours/avoirs · ventes à crédit et créances clients · sessions de caisse (écart de caisse) · TVA par produit · achats HT/TTC · remises et promotions · statistiques (évolution, marge par catégorie, comparaison de périodes) · codes-barres (douchette, caméra, étiquettes) · inventaire avec indicateurs, historique des écarts et fiches imprimables (comptage vierge, résultat).
 
-Prerequis : Node.js 20+ et PHP 8.3+ avec l'extension SQLite active.
+- **Interface** : React 19 + TypeScript + Vite + Tailwind (`src/`)
+- **API** : Laravel 13 + Sanctum + SQLite (`backend/`) — voir [backend/README.md](backend/README.md)
+
+## Deux façons de l'utiliser
+
+| | Avec serveur (Laravel) | Sans serveur (GitHub Pages) |
+| --- | --- | --- |
+| Lancement | `start-local.cmd` (ou `npm run dev:api` + `npm run dev`) | publié automatiquement à chaque push sur `main` ; en local : `npm run dev:pages` |
+| Données | base SQLite du serveur, **partagée** entre tous les postes | `localStorage` du navigateur, **propres à ce navigateur** |
+| Usage conseillé | magasin réel, plusieurs caisses | démonstration, essai, poste unique |
+
+La version sans serveur rejoue toute l'API dans le navigateur (`src/local/` : mêmes règles métier, mêmes contrôles de droits,
+mots de passe hachés). Elle est compilée par `npm run build:pages`. Ses données disparaissent si le cache du navigateur est vidé :
+*Paramètres → Données de ce navigateur* permet de télécharger une sauvegarde, de la restaurer (ou de la transférer sur un autre poste)
+et de tout effacer. Premier lancement : `admin@himarket.sn` / `admin123`.
+
+## Lancer en local
+
+Voir [GUIDE_LOCAL.md](GUIDE_LOCAL.md). En résumé :
 
 ```cmd
 npm install
-cd backend
-composer install
-copy .env.example .env
-php artisan key:generate
-php artisan migrate:fresh --seed
-cd ..
+cd backend && composer install && copy .env.example .env && php artisan key:generate && php artisan migrate:fresh --seed && cd ..
 start-local.cmd
 ```
 
-Le frontend est disponible sur `http://127.0.0.1:5173` et l'API sur `http://127.0.0.1:8000`.
+Puis ouvrir http://127.0.0.1:5173 — `admin@himarket.sn` / `admin123`.
 
-Les donnees de l'interface sont conservees localement dans le navigateur. Le backend utilise une base SQLite preconfiguree dans `backend/database/database.sqlite`, avec une API Sanctum prete pour l'integration progressive ou un client externe.
+## Contrôle qualité
 
-Comptes de demonstration :
+```cmd
+npm run typecheck     # TypeScript
+npm run test:api      # 93 tests Laravel
+```
 
-- `admin@himarket.sn` / `admin123`
-- `fatou@himarket.sn` / `fatou123`
-- `ibrahima@himarket.sn` / `ibrahima123`
-
-Pour reconstruire seulement les donnees API : `npm run setup:api`.
+Audit complet et pistes d'amélioration : [AUDIT.md](AUDIT.md).

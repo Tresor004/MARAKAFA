@@ -4,77 +4,64 @@ namespace App\Services;
 
 use App\Models\Loss;
 use App\Models\Product;
-use Illuminate\Support\Facades\Auth;
+use App\Models\User;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
 
 class LossService
 {
-    public function createLoss(array $data): Loss
+    public function __construct(protected StockService $stock) {}
+
+    /**
+     * Déclare une perte : retire la quantité du stock et valorise la perte au coût d'achat courant.
+     * Une perte est TOUJOURS saisie par un employé (jamais auto-générée par le système).
+     */
+    public function create(User $author, int $productId, float $quantity, string $reason, ?string $date = null): Loss
     {
-        return DB::transaction(function () use ($data) {
-            $user = Auth::user();
+        return DB::transaction(function () use ($author, $productId, $quantity, $reason, $date) {
+            $product = Product::find($productId);
+            if (! $product) {
+                throw ValidationException::withMessages(['product_id' => ['Produit introuvable.']]);
+            }
+
+            $quantity = round($quantity, 3);
+            if ($quantity <= 0) {
+                throw ValidationException::withMessages(['quantity' => ['La quantité doit être supérieure à zéro.']]);
+            }
 
             $loss = Loss::create([
-                'product_id'     => $data['product_id'],
-                'product_name'   => $data['product_name'],
-                'quantity'       => $data['quantity'],
-                'unit_price'     => $data['unit_price'],
-                'total'          => $data['total'],
-                'reason'         => $data['reason'],
-                'noted_by'       => $data['noted_by'] ?? $user?->id,
-                'auto_generated' => $data['auto_generated'] ?? false,
-                'loss_date'      => $data['loss_date'] ?? today()->toDateString(),
+                'product_id'     => $product->id,
+                'product_name'   => $product->name,
+                'quantity'       => $quantity,
+                'unit_price'     => $product->cost,
+                'total'          => round($quantity * (float) $product->cost, 2),
+                'reason'         => $reason,
+                'noted_by'       => $author->id,
+                'auto_generated' => false,
+                'loss_date'      => $date ?: today()->toDateString(),
             ]);
 
-            // Décrémentation du stock
-            Product::where('id', $data['product_id'])
-                ->decrement('stock', $data['quantity']);
+            // Échoue (et annule la perte) si la quantité dépasse le stock disponible
+            $this->stock->decrease($product->id, $quantity, $product->name, [
+                'type' => 'loss', 'user' => $author, 'reason' => "Perte : {$reason}",
+                'ref_type' => 'loss', 'ref_id' => $loss->id,
+            ]);
 
             return $loss;
         });
     }
 
-    /**
-     * Détecte et enregistre automatiquement les produits périmés.
-     * Appelé par une commande planifiée (schedule).
-     */
-    public function processExpiredProducts(NotificationService $notif): int
+    /** Supprime une entrée de perte et remet la quantité en stock (annulation d'une saisie erronée). */
+    public function delete(Loss $loss, ?User $by = null): void
     {
-        $today    = today()->toDateString();
-        $expired  = Product::where('stock', '>', 0)
-            ->whereDate('expiry_date', '<', $today)
-            ->get();
-
-        if ($expired->isEmpty()) {
-            return 0;
-        }
-
-        foreach ($expired as $product) {
-            DB::transaction(function () use ($product, $today) {
-                Loss::create([
-                    'product_id'     => $product->id,
-                    'product_name'   => $product->name,
-                    'quantity'       => $product->stock,
-                    'unit_price'     => $product->cost,
-                    'total'          => $product->stock * $product->cost,
-                    'reason'         => 'Péremption',
-                    'noted_by'       => null,
-                    'auto_generated' => true,
-                    'loss_date'      => $today,
+        DB::transaction(function () use ($loss, $by) {
+            if ($loss->product_id && Product::whereKey($loss->product_id)->exists()) {
+                $this->stock->increase($loss->product_id, (float) $loss->quantity, [
+                    'type' => 'loss_cancel', 'user' => $by, 'reason' => "Annulation de la perte « {$loss->reason} »",
+                    'ref_type' => 'loss', 'ref_id' => $loss->id,
                 ]);
-                $product->update(['stock' => 0]);
-            });
-        }
-
-        $names = $expired->pluck('name')->implode(', ');
-        $notif->notifyAll(
-            'Produits périmés détectés',
-            "{$expired->count()} produit(s) périmé(s) enregistré(s) en pertes : {$names}.",
-            'warning',
-            null,
-            'Système'
-        );
-
-        return $expired->count();
+            }
+            $loss->delete();
+        });
     }
 }

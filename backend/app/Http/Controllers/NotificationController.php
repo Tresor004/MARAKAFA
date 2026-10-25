@@ -2,77 +2,52 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Support\Present;
 use App\Models\AppNotification;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class NotificationController extends Controller
 {
-    /**
-     * GET /api/notifications
-     * Retourne les notifications de l'utilisateur connecté :
-     *   - Les notifications personnelles (user_id = moi)
-     *   - Les notifications générales (user_id = null, scope = general)
-     */
-    public function index(Request $request)
+    public function index(Request $request): JsonResponse
     {
-        $userId = $request->user()->id;
+        $user = $request->user();
 
-        $notifications = AppNotification::where(function ($q) use ($userId) {
-            $q->where('user_id', $userId)
-              ->orWhere(fn($q2) => $q2->whereNull('user_id')->where('scope', 'general'));
-        })
-        ->orderByDesc('notified_at')
-        ->paginate(100);
+        $rows = AppNotification::visibleTo($user)->orderByDesc('notified_at')->orderByDesc('id')->limit(200)->get();
+        $read = DB::table('notification_reads')->where('user_id', $user->id)
+            ->whereIn('notification_id', $rows->pluck('id'))->pluck('notification_id')->map(fn ($i) => (int) $i)->all();
 
-        return response()->json($notifications);
+        return response()->json($rows->map(fn ($n) => Present::notification($n, $read))->values());
     }
 
-    /**
-     * POST /api/notifications/mark-all-read
-     */
+    public function markRead(Request $request, int $notification): JsonResponse
+    {
+        $user = $request->user();
+        $n = AppNotification::visibleTo($user)->whereKey($notification)->firstOrFail();
+
+        DB::table('notification_reads')->insertOrIgnore([
+            'notification_id' => $n->id, 'user_id' => $user->id, 'read_at' => now(),
+        ]);
+
+        return response()->json(['ok' => true]);
+    }
+
     public function markAllRead(Request $request): JsonResponse
     {
-        $userId = $request->user()->id;
+        $user = $request->user();
 
-        AppNotification::where(function ($q) use ($userId) {
-            $q->where('user_id', $userId)
-              ->orWhere(fn($q2) => $q2->whereNull('user_id')->where('scope', 'general'));
-        })->update(['is_read' => true]);
+        $ids = AppNotification::visibleTo($user)
+            ->whereNotIn('id', DB::table('notification_reads')->where('user_id', $user->id)->select('notification_id'))
+            ->pluck('id');
 
-        return response()->json(['message' => 'Toutes les notifications ont été marquées comme lues.']);
-    }
+        $now = now();
+        foreach ($ids->chunk(200) as $chunk) {
+            DB::table('notification_reads')->insertOrIgnore(
+                $chunk->map(fn ($id) => ['notification_id' => $id, 'user_id' => $user->id, 'read_at' => $now])->all()
+            );
+        }
 
-    /**
-     * PATCH /api/notifications/{id}/read
-     */
-    public function markRead(Request $request, AppNotification $notification): JsonResponse
-    {
-        // Vérifie que la notification appartient à cet utilisateur
-        $userId = $request->user()->id;
-        abort_unless(
-            $notification->user_id === $userId || $notification->scope === 'general',
-            403
-        );
-
-        $notification->update(['is_read' => true]);
-        return response()->json(['message' => 'Notification marquée comme lue.']);
-    }
-
-    /**
-     * GET /api/notifications/unread-count
-     */
-    public function unreadCount(Request $request): JsonResponse
-    {
-        $userId = $request->user()->id;
-
-        $count = AppNotification::where('is_read', false)
-            ->where(function ($q) use ($userId) {
-                $q->where('user_id', $userId)
-                  ->orWhere(fn($q2) => $q2->whereNull('user_id')->where('scope', 'general'));
-            })
-            ->count();
-
-        return response()->json(['count' => $count]);
+        return response()->json(['ok' => true]);
     }
 }

@@ -1,7 +1,16 @@
-import { createContext, useContext, useState, useEffect, ReactNode } from "react";
-import { Product, Sale, Purchase, Customer, Supplier, User, Loss, InventoryCount, SaleItem, PurchaseItem, Role, ShopSettings, PendingAction, ActionKind, AppNotification } from "./types";
-import { seedProducts, seedCustomers, seedSuppliers, seedUsers, seedSales, seedPurchases, seedLosses, seedInventory, seedRoles } from "./seedData";
+import { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode } from "react";
+import { Product, Sale, Purchase, Customer, Supplier, User, Loss, InventoryCount, Role, ShopSettings, PendingAction, ActionKind, AppNotification, Promotion, CashSession } from "./types";
 import { NavKey } from "./components/nav";
+import { api, ApiError, errMsg, getToken, setToken, setUnauthorizedHandler } from "./api";
+import { useToast } from "./components/ui";
+
+/**
+ * Store Hi-Market — cache de l'API.
+ *
+ * Toutes les données métier viennent du serveur Laravel (aucune donnée n'est persistée dans le navigateur,
+ * hormis le jeton de session). Les écritures sont asynchrones ; après chaque écriture, les ressources
+ * concernées sont rechargées depuis l'API (le serveur est la seule source de vérité : stocks, totaux, numéros).
+ */
 
 export const DEFAULT_SETTINGS: ShopSettings = {
   name: "Hi-Market",
@@ -23,9 +32,36 @@ export const DEFAULT_SETTINGS: ShopSettings = {
   invoicePrefix: "FAC",
   invoiceFooter: "",
   thankYouMessage: "Merci pour votre visite ! À bientôt.",
+  maxDiscountPercent: 10,
+  requireCashSession: false,
+  allowCredit: true,
 };
 
+/** done = exécuté ; pending = demande envoyée à l'administrateur ; error = refusé par le serveur (message déjà affiché) */
+export type ActionResult = "done" | "pending" | "error";
+
+export type Resource =
+  | "me" | "products" | "categories" | "customers" | "suppliers" | "users" | "sales" | "purchases"
+  | "losses" | "inventory" | "roles" | "settings" | "pending" | "notifications" | "online"
+  | "promotions" | "cashSession";
+
+/** Ligne de panier envoyée au serveur : seuls produit, quantité et remise manuelle — les montants sont calculés côté serveur. */
+export interface CartLine { productId: string; quantity: number; discountPercent?: number }
+
+type CategoryRow = { id: string; name: string; productsCount: number };
+
+interface ActionMeta {
+  kind: ActionKind;
+  module: string;
+  action: string;
+  description: string;
+  details?: Record<string, unknown>;
+  payload: Record<string, unknown>;
+}
+
 interface StoreContextType {
+  /** false tant que la session (jeton) n'a pas été vérifiée au démarrage */
+  ready: boolean;
   products: Product[];
   sales: Sale[];
   purchases: Purchase[];
@@ -35,541 +71,397 @@ interface StoreContextType {
   losses: Loss[];
   inventory: InventoryCount[];
   roles: Role[];
+  promotions: Promotion[];
+  /** Ma caisse ouverte (null = aucune) */
+  cashSession: CashSession | null;
   shopSettings: ShopSettings;
+  categories: string[];
+  /** Catégories avec leur identifiant (ciblage des promotions) */
+  categoryList: { id: string; name: string }[];
   currentUser: User | null;
   currentUserRole: Role | undefined;
   canAccess: (key: NavKey) => boolean;
   roleName: (roleId: string) => string;
   isAdmin: boolean;
-  login: (email: string, password: string) => { ok: boolean; error?: string };
-  logout: () => void;
+  login: (identifier: string, password: string) => Promise<{ ok: boolean; error?: string }>;
+  logout: () => Promise<void>;
+  forgotPassword: (identifier: string) => Promise<{ ok: boolean; message: string }>;
+  /** Re-vérifie le mot de passe de l'utilisateur connecté (opérations sensibles). */
+  verifyPassword: (password: string) => Promise<boolean>;
   isLoggedIn: boolean;
+  refresh: (...resources: Resource[]) => Promise<void>;
 
   pendingActions: PendingAction[];
   pendingCount: number;
-  approveAction: (id: string) => void;
-  rejectAction: (id: string, reason: string) => void;
-  /** Exécute directement si admin, sinon crée une demande en attente. Retourne true si exécuté immédiatement. */
-  requestOrExec: (meta: { kind: ActionKind; module: string; action: string; description: string; details?: Record<string, unknown>; payload: Record<string, unknown> }) => boolean;
+  approveAction: (id: string) => Promise<boolean>;
+  rejectAction: (id: string, reason: string) => Promise<boolean>;
+  /** Admin : exécute directement. Autre employé : crée une demande de validation. */
+  requestOrExec: (meta: ActionMeta) => Promise<ActionResult>;
 
   notifications: AppNotification[];
   myNotifications: AppNotification[];
   unreadCount: number;
   markAllRead: () => void;
   markRead: (id: string) => void;
-  notifyAll: (title: string, message: string, type?: AppNotification["type"], byId?: string, byName?: string, targetPage?: string, targetId?: string) => void;
-  updateProfile: (data: { name?: string; email?: string; password?: string; avatar?: string }) => Promise<boolean>;
+  updateProfile: (data: { name?: string; email?: string; password?: string; avatar?: string }) => Promise<ActionResult>;
   makeAvatarPreview: (dataUrl: string, maxSize?: number) => Promise<string>;
   onlineUsers: string[];
 
-  addProduct: (p: Omit<Product, "id">) => void;
-  updateProduct: (id: string, p: Partial<Product>) => void;
-  deleteProduct: (id: string) => void;
+  /** `paid` omis = payé en totalité ; inférieur au total = paiement partiel / à crédit (client obligatoire). */
+  addSale: (items: CartLine[], customerId?: string, paymentMethod?: string, paid?: number) => Promise<Sale | null>;
 
-  addSale: (items: SaleItem[], customerId?: string, customerName?: string, paymentMethod?: string, paid?: number) => Sale;
+  openCashSession: (openingFloat: number) => Promise<boolean>;
+  closeCashSession: (id: string, countedCash: number, note: string) => Promise<CashSession | null>;
+  /** Encaisse un règlement sur la créance d'un client (sans saleId : dettes les plus anciennes d'abord). */
+  settleCustomer: (customerId: string, data: { amount: number; method: string; saleId?: string; note?: string }) => Promise<boolean>;
 
-  addPurchase: (items: PurchaseItem[], supplierId: string, supplierName: string) => Purchase;
-  updatePurchase: (id: string, p: Partial<Purchase>) => void;
-  deletePurchase: (id: string) => void;
+  addRole: (r: Pick<Role, "name" | "description" | "permissions">) => Promise<Role | null>;
+  updateRole: (id: string, r: Pick<Role, "name" | "description" | "permissions">) => Promise<boolean>;
+  deleteRole: (id: string) => Promise<boolean>;
 
-  addCustomer: (c: Omit<Customer, "id" | "totalPurchases" | "createdAt">) => void;
-  updateCustomer: (id: string, c: Partial<Customer>) => void;
-  deleteCustomer: (id: string) => void;
+  updateShopSettings: (s: Partial<ShopSettings>) => Promise<boolean>;
 
-  addSupplier: (s: Omit<Supplier, "id">) => void;
-  updateSupplier: (id: string, s: Partial<Supplier>) => void;
-  deleteSupplier: (id: string) => void;
-
-  addUser: (u: Omit<User, "id" | "createdAt">) => void;
-  updateUser: (id: string, u: Partial<User>) => void;
-  deleteUser: (id: string) => void;
-
-  addRole: (r: Omit<Role, "id" | "createdAt">) => Role;
-  updateRole: (id: string, r: Partial<Role>) => void;
-  deleteRole: (id: string) => void;
-
-  addLoss: (l: Omit<Loss, "id">) => void;
-  deleteLoss: (id: string) => void;
-
-  doInventory: (counts: { productId: string; productName: string; expected: number; actual: number }[], period: string) => void;
-
-  adjustStock: (productId: string, delta: number) => void;
-
-  updateShopSettings: (s: Partial<ShopSettings>) => void;
-
-  categories: string[];
-  addCategory: (name: string) => void;
-  deleteCategory: (name: string) => void;
-  renameCategory: (oldName: string, newName: string) => void;
+  addCategory: (name: string) => Promise<boolean>;
+  deleteCategory: (name: string) => Promise<boolean>;
+  renameCategory: (oldName: string, newName: string) => Promise<boolean>;
 }
 
 const StoreContext = createContext<StoreContextType | null>(null);
 
-const uid = (p = "id") => p + "_" + Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-3);
+/** Page (permission) requise pour lire chaque ressource — évite des appels voués au 403. */
+const READ_PERMISSIONS: Partial<Record<Resource, NavKey[]>> = {
+  customers: ["customers", "sales"],
+  suppliers: ["suppliers", "purchases"],
+  users: ["users"],
+  sales: ["sales", "dashboard", "inventory", "myspace"],
+  purchases: ["purchases", "suppliers", "dashboard", "inventory"],
+  losses: ["losses", "dashboard", "inventory"],
+  inventory: ["inventory"],
+  cashSession: ["sales"],
+};
 
-function loadState<T>(key: string, fallback: T): T {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return fallback;
-    return JSON.parse(raw) as T;
-  } catch {
-    return fallback;
-  }
-}
+const ALL_RESOURCES: Resource[] = [
+  "products", "categories", "customers", "suppliers", "users", "sales", "purchases", "losses",
+  "inventory", "roles", "settings", "pending", "notifications", "online", "promotions", "cashSession",
+];
 
 export function StoreProvider({ children }: { children: ReactNode }) {
-  const [products, setProducts] = useState<Product[]>(() => loadState("hm_products", seedProducts));
-  const [sales, setSales] = useState<Sale[]>(() => loadState("hm_sales", seedSales));
-  const [purchases, setPurchases] = useState<Purchase[]>(() => loadState("hm_purchases", seedPurchases));
-  const [customers, setCustomers] = useState<Customer[]>(() => loadState("hm_customers", seedCustomers));
-  const [suppliers, setSuppliers] = useState<Supplier[]>(() => loadState("hm_suppliers", seedSuppliers));
-  const [users, setUsers] = useState<User[]>(() => {
-    const loaded = loadState<User[]>("hm_users", seedUsers);
-    // Migration douce : garantir un mot de passe pour chaque employé existant
-    return loaded.map(u => {
-      if (u.password) return u;
-      const stem = (u.email?.split("@")[0] || u.name.toLowerCase().replace(/\s+/g, "") || "user").slice(0, 12);
-      return { ...u, password: stem + "123" };
-    });
-  });
-  const [losses, setLosses] = useState<Loss[]>(() => loadState("hm_losses", seedLosses));
-  const [inventory, setInventory] = useState<InventoryCount[]>(() => loadState("hm_inventory", seedInventory));
-  const [roles, setRoles] = useState<Role[]>(() => loadState("hm_roles", seedRoles));
-  const [shopSettings, setShopSettings] = useState<ShopSettings>(() => ({ ...DEFAULT_SETTINGS, ...loadState<Partial<ShopSettings>>("hm_settings", {}) }));
-  const defaultCategories = ["Epicerie", "Boissons", "Laitier", "Boulangerie", "Hygiène", "Frais", "Divers"];
-  const [categories, setCategories] = useState<string[]>(() => {
-    const stored = loadState<string[]>("hm_categories", []);
-    if (stored.length > 0) return stored;
-    // Bootstrap from existing products + defaults
-    const fromProducts = Array.from(new Set(products.map(p => p.category))).filter(Boolean);
-    const merged = Array.from(new Set([...defaultCategories, ...fromProducts]));
-    return merged.sort((a, b) => a.localeCompare(b, "fr"));
-  });
-  const [currentUserId, setCurrentUserId] = useState<string | null>(() => loadState<string | null>("hm_currentUser", null));
-  const currentUser = users.find(u => u.id === currentUserId) || null;
-  const currentUserRole = currentUser ? roles.find(r => r.id === currentUser.role) : undefined;
-  const isAdmin = currentUser?.role === "admin";
-  useEffect(() => { localStorage.setItem("hm_currentUser", JSON.stringify(currentUserId)); }, [currentUserId]);
+  const { push } = useToast();
 
-  const [pendingActions, setPendingActions] = useState<PendingAction[]>(() => loadState<PendingAction[]>("hm_pending", []));
-  useEffect(() => { localStorage.setItem("hm_pending", JSON.stringify(pendingActions)); }, [pendingActions]);
-  const pendingCount = pendingActions.filter(a => a.status === "pending").length;
+  const [ready, setReady] = useState(false);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [currentUserRole, setCurrentUserRole] = useState<Role | undefined>(undefined);
 
-  const [notifications, setNotifications] = useState<AppNotification[]>(() => loadState<AppNotification[]>("hm_notifs", []));
-  useEffect(() => { localStorage.setItem("hm_notifs", JSON.stringify(notifications)); }, [notifications]);
+  const [products, setProducts] = useState<Product[]>([]);
+  const [sales, setSales] = useState<Sale[]>([]);
+  const [purchases, setPurchases] = useState<Purchase[]>([]);
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [suppliers, setSuppliers] = useState<Supplier[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [losses, setLosses] = useState<Loss[]>([]);
+  const [inventory, setInventory] = useState<InventoryCount[]>([]);
+  const [roles, setRoles] = useState<Role[]>([]);
+  const [promotions, setPromotions] = useState<Promotion[]>([]);
+  const [cashSession, setCashSession] = useState<CashSession | null>(null);
+  const [shopSettings, setShopSettings] = useState<ShopSettings>(DEFAULT_SETTINGS);
+  const [categoryRows, setCategoryRows] = useState<CategoryRow[]>([]);
+  const [pendingActions, setPendingActions] = useState<PendingAction[]>([]);
+  const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const [onlineUsers, setOnlineUsers] = useState<string[]>([]);
 
-  // Crée une notification avec navigation ciblée
-  const pushNotif = (
-    userId: string,
-    title: string,
-    message: string,
-    type: AppNotification["type"],
-    scope: AppNotification["scope"],
-    triggeredById = "system",
-    triggeredByName = "Système",
-    targetPage?: string,
-    targetId?: string,
-  ) => {
-    const n: AppNotification = {
-      id: uid("n"), userId, title, message, type,
-      date: Date.now(), read: false, scope,
-      triggeredById, triggeredByName,
-      targetPage, targetId,
-    };
-    setNotifications(ns => [n, ...ns].slice(0, 500));
+  const isAdmin = currentUserRole?.slug === "admin";
+  const roleRef = useRef<Role | undefined>(undefined);
+  const userRef = useRef<User | null>(null);
+  roleRef.current = currentUserRole;
+  userRef.current = currentUser;
+
+  const canAccess = (key: NavKey): boolean => {
+    if (!currentUserRole) return false;
+    return currentUserRole.slug === "admin" || currentUserRole.permissions.includes(key);
+  };
+  const canAny = (keys: NavKey[]): boolean => {
+    const r = roleRef.current;
+    if (!r) return false;
+    return r.slug === "admin" || keys.some(k => r.permissions.includes(k));
+  };
+  const roleName = (roleId: string): string => roles.find(r => r.id === roleId)?.name || (currentUserRole?.id === roleId ? currentUserRole.name : roleId);
+
+  // ───────────────────────── Chargement des ressources ─────────────────────────
+  const loaders: Record<Resource, () => Promise<void>> = {
+    me: async () => {
+      const r = await api<{ user: User; role: Role }>("GET", "/me");
+      setCurrentUser(r.user);
+      setCurrentUserRole(r.role);
+      roleRef.current = r.role;
+      userRef.current = r.user;
+    },
+    products: async () => setProducts(await api<Product[]>("GET", "/products")),
+    categories: async () => setCategoryRows(await api<CategoryRow[]>("GET", "/categories")),
+    customers: async () => setCustomers(await api<Customer[]>("GET", "/customers")),
+    suppliers: async () => setSuppliers(await api<Supplier[]>("GET", "/suppliers")),
+    users: async () => setUsers(await api<User[]>("GET", "/users")),
+    sales: async () => setSales(await api<Sale[]>("GET", "/sales")),
+    purchases: async () => setPurchases(await api<Purchase[]>("GET", "/purchases")),
+    losses: async () => setLosses(await api<Loss[]>("GET", "/losses")),
+    inventory: async () => setInventory(await api<InventoryCount[]>("GET", "/inventory")),
+    roles: async () => setRoles(await api<Role[]>("GET", "/roles")),
+    settings: async () => setShopSettings({ ...DEFAULT_SETTINGS, ...(await api<ShopSettings>("GET", "/settings")) }),
+    pending: async () => setPendingActions(await api<PendingAction[]>("GET", "/pending-actions")),
+    notifications: async () => setNotifications(await api<AppNotification[]>("GET", "/notifications")),
+    online: async () => setOnlineUsers(await api<string[]>("GET", "/users/online")),
+    promotions: async () => setPromotions(await api<Promotion[]>("GET", "/promotions")),
+    cashSession: async () => { const r = await api<CashSession | null>("GET", "/cash-sessions/current"); setCashSession(r && r.id ? r : null); },
   };
 
-  // Notifie tous les employés (scope général) avec page cible optionnelle
-  const notifyAll = (
-    title: string,
-    message: string,
-    type: AppNotification["type"] = "info",
-    byId = "system",
-    byName = "Système",
-    targetPage?: string,
-    targetId?: string,
-  ) => pushNotif("*", title, message, type, "general", byId, byName, targetPage, targetId);
-
-  const myNotifications = notifications.filter(n => n.userId === "*" || n.userId === currentUserId);
-  const unreadCount = myNotifications.filter(n => !n.read).length;
-  const markAllRead = () => setNotifications(ns => ns.map(n => (n.userId === "*" || n.userId === currentUserId) ? { ...n, read: true } : n));
-  const markRead = (id: string) => setNotifications(ns => ns.map(n => n.id === id ? { ...n, read: true } : n));
-
-  useEffect(() => { localStorage.setItem("hm_products", JSON.stringify(products)); }, [products]);
-  useEffect(() => { localStorage.setItem("hm_sales", JSON.stringify(sales)); }, [sales]);
-  useEffect(() => { localStorage.setItem("hm_purchases", JSON.stringify(purchases)); }, [purchases]);
-  useEffect(() => { localStorage.setItem("hm_customers", JSON.stringify(customers)); }, [customers]);
-  useEffect(() => { localStorage.setItem("hm_suppliers", JSON.stringify(suppliers)); }, [suppliers]);
-  useEffect(() => { localStorage.setItem("hm_users", JSON.stringify(users)); }, [users]);
-  useEffect(() => { localStorage.setItem("hm_losses", JSON.stringify(losses)); }, [losses]);
-  useEffect(() => { localStorage.setItem("hm_inventory", JSON.stringify(inventory)); }, [inventory]);
-  useEffect(() => { localStorage.setItem("hm_roles", JSON.stringify(roles)); }, [roles]);
-  useEffect(() => { localStorage.setItem("hm_settings", JSON.stringify(shopSettings)); }, [shopSettings]);
-  useEffect(() => { localStorage.setItem("hm_categories", JSON.stringify(categories)); }, [categories]);
-
-  // Détection automatique des produits périmés → NOTIFICATION uniquement aux utilisateurs ayant accès au module pertes
-  // Le système n'enregistre PAS lui-même la perte (règle 6)
-  useEffect(() => {
-    const today = new Date().toISOString().slice(0, 10);
-    const expired = products.filter(p => p.stock > 0 && p.expiryDate && p.expiryDate < today);
-    if (expired.length === 0) return;
-    const names = expired.map(p => p.name).join(", ");
-    // Notifie uniquement les employés ayant accès au module "losses"
-    const lossUsers = users.filter(u => {
-      const role = roles.find(r => r.id === u.role);
-      return role?.permissions?.includes("losses");
-    });
-    lossUsers.forEach(u => {
-      pushNotif(
-        u.id,
-        "Produits périmés détectés",
-        `${expired.length} produit(s) périmé(s) nécessite(nt) une déclaration de perte : ${names}. Veuillez déclarer ces pertes manuellement dans le module Pertes & Péremptions.`,
-        "warning",
-        "personal",
-        "system",
-        "Système"
-      );
-    });
+  const refresh = useCallback(async (...resources: Resource[]) => {
+    const wanted = Array.from(new Set(resources));
+    await Promise.allSettled(wanted.map(async res => {
+      const need = READ_PERMISSIONS[res];
+      if (res !== "me" && need && !canAny(need)) return;
+      try { await loaders[res](); } catch (e) {
+        if (!(e instanceof ApiError && (e.status === 401 || e.status === 403))) console.warn(`[store] ${res}:`, errMsg(e));
+      }
+    }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const canAccess = (key: NavKey): boolean => {
-    if (!currentUserRole) return true; // fallback : si rôle inconnu, on ne verrouille pas (sécurité anti-lockout)
-    return currentUserRole.permissions.includes(key);
-  };
-  const roleName = (roleId: string): string => roles.find(r => r.id === roleId)?.name || roleId;
-
-  const addProduct = (p: Omit<Product, "id">) => setProducts(ps => [...ps, { ...p, id: uid("p") }]);
-  const updateProduct = (id: string, p: Partial<Product>) => setProducts(ps => ps.map(x => x.id === id ? { ...x, ...p } : x));
-  const deleteProduct = (id: string) => setProducts(ps => ps.filter(x => x.id !== id));
-
-  const addSale = (items: SaleItem[], customerId?: string, customerName?: string, paymentMethod = "Espèces", paidOverride?: number): Sale => {
-    const total = items.reduce((a, b) => a + b.total, 0);
-    const paid = paidOverride ?? total;
-    const change = Math.max(paid - total, 0);
-    const newSale: Sale = {
-      id: uid("v"),
-      invoiceNo: "FAC-" + new Date().getFullYear() + "-" + String(sales.length + 1).padStart(4, "0"),
-      items, total, paid, change,
-      customerId, customerName,
-      userId: currentUser?.id || "", userName: currentUser?.name || "",
-      date: new Date().toISOString().slice(0, 10),
-      paymentMethod
-    };
-    setSales(s => [newSale, ...s]);
-    setProducts(ps => ps.map(p => {
-      const item = items.find(i => i.productId === p.id);
-      return item ? { ...p, stock: Math.max(p.stock - item.quantity, 0) } : p;
-    }));
-    if (customerId) {
-      setCustomers(cs => cs.map(c => c.id === customerId ? { ...c, totalPurchases: c.totalPurchases + total } : c));
-    }
-    return newSale;
+  /** Réinitialise tout (déconnexion / session expirée) : aucune donnée ne reste en mémoire. */
+  const resetState = () => {
+    setCurrentUser(null); setCurrentUserRole(undefined);
+    setProducts([]); setSales([]); setPurchases([]); setCustomers([]); setSuppliers([]); setUsers([]);
+    setLosses([]); setInventory([]); setRoles([]); setCategoryRows([]); setPendingActions([]);
+    setNotifications([]); setOnlineUsers([]); setPromotions([]); setCashSession(null);
+    roleRef.current = undefined; userRef.current = null;
   };
 
-  const addPurchase = (items: PurchaseItem[], supplierId: string, supplierName: string): Purchase => {
-    const total = items.reduce((a, b) => a + b.total, 0);
-    const ref = "BA-" + new Date().getFullYear() + "-" + String(purchases.length + 1).padStart(4, "0");
-    const newPurchase: Purchase = { id: uid("a"), items, total, supplierId, supplierName, reference: ref, date: new Date().toISOString().slice(0, 10), managerName: currentUser?.name || "" };
-    setPurchases(a => [newPurchase, ...a]);
-    setProducts(ps => {
-      const updated = [...ps];
-      items.forEach(item => {
-        const idx = updated.findIndex(p => p.id === item.productId);
-        if (idx >= 0) {
-          updated[idx] = { ...updated[idx], stock: updated[idx].stock + item.quantity, cost: item.price };
-        } else {
-          updated.push({
-            id: uid("p"), name: item.name, category: "Divers", price: Math.round(item.price * 1.3),
-            cost: item.price, stock: item.quantity, minStock: 5, unit: "pièce"
-          });
-        }
-      });
-      return updated;
+  // Les employés sans accès à la liste complète voient au moins leur propre fiche
+  useEffect(() => {
+    // Vérifié dans la mise à jour elle-même : la liste a pu être rechargée entre-temps (sinon doublon)
+    if (currentUser && !users.some(u => u.id === currentUser.id)) setUsers(us => (us.some(u => u.id === currentUser.id) ? us : [...us, currentUser]));
+  }, [currentUser, users]);
+
+  // ───────────────────────── Démarrage : reprise de session ─────────────────────────
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setToken(null);
+      resetState();
+      push("Votre session a expiré. Veuillez vous reconnecter.", "error");
     });
-    return newPurchase;
-  };
-  const updatePurchase = (id: string, p: Partial<Purchase>) => setPurchases(ps => ps.map(x => x.id === id ? { ...x, ...p } : x));
-  const deletePurchase = (id: string) => setPurchases(ps => ps.filter(x => x.id !== id));
-
-  const addCustomer = (c: Omit<Customer, "id" | "totalPurchases" | "createdAt">) =>
-    setCustomers(cs => [...cs, { ...c, id: uid("c"), totalPurchases: 0, createdAt: new Date().toISOString().slice(0, 10) }]);
-  const updateCustomer = (id: string, c: Partial<Customer>) => setCustomers(cs => cs.map(x => x.id === id ? { ...x, ...c } : x));
-  const deleteCustomer = (id: string) => setCustomers(cs => cs.filter(x => x.id !== id));
-
-  const addSupplier = (s: Omit<Supplier, "id">) => setSuppliers(ss => [...ss, { ...s, id: uid("s") }]);
-  const updateSupplier = (id: string, s: Partial<Supplier>) => setSuppliers(ss => ss.map(x => x.id === id ? { ...x, ...s } : x));
-  const deleteSupplier = (id: string) => setSuppliers(ss => ss.filter(x => x.id !== id));
-
-  const addUser = (u: Omit<User, "id" | "createdAt">) => setUsers(us => [...us, { ...u, id: uid("u"), createdAt: new Date().toISOString().slice(0, 10) }]);
-  const updateUser = (id: string, u: Partial<User>) => setUsers(us => us.map(x => x.id === id ? { ...x, ...u } : x));
-  const deleteUser = (id: string) => setUsers(us => us.filter(x => x.id !== id));
-
-  const addRole = (r: Omit<Role, "id" | "createdAt">): Role => {
-    const newRole: Role = { ...r, id: uid("r"), createdAt: new Date().toISOString().slice(0, 10) };
-    setRoles(rs => [...rs, newRole]);
-    return newRole;
-  };
-  const updateRole = (id: string, r: Partial<Role>) => setRoles(rs => rs.map(x => x.id === id ? { ...x, ...r } : x));
-  const deleteRole = (id: string) => setRoles(rs => rs.filter(x => x.id !== id));
-
-  const addLoss = (l: Omit<Loss, "id">) => {
-    setLosses(ls => [{ ...l, id: uid("pe") }, ...ls]);
-    setProducts(ps => ps.map(p => p.id === l.productId ? { ...p, stock: Math.max(p.stock - l.quantity, 0) } : p));
-  };
-  const deleteLoss = (id: string) => setLosses(ls => ls.filter(x => x.id !== id));
-
-  const doInventory = (counts: { productId: string; productName: string; expected: number; actual: number }[], period: string) => {
-    const date = new Date().toISOString().slice(0, 10);
-    const entries: InventoryCount[] = counts.map(c => ({
-      id: uid("i"), productId: c.productId, productName: c.productName,
-      expected: c.expected, actual: c.actual, difference: c.actual - c.expected, date, period
-    }));
-    setInventory(inv => [...entries, ...inv]);
-    entries.forEach(e => {
-      setProducts(ps => ps.map(p => p.id === e.productId ? { ...p, stock: e.actual } : p));
-    });
-  };
-
-  const adjustStock = (productId: string, delta: number) => setProducts(ps => ps.map(p => p.id === productId ? { ...p, stock: Math.max(p.stock + delta, 0) } : p));
-
-  const updateShopSettings = (s: Partial<ShopSettings>) => setShopSettings(prev => ({ ...prev, ...s }));
-
-  const login = (identifier: string, password: string): { ok: boolean; error?: string } => {
-    const q = identifier.trim().toLowerCase();
-    const user = users.find(u =>
-      u.email.toLowerCase() === q ||
-      u.name.toLowerCase() === q ||
-      (u.phone || "").replace(/\s/g, "") === q.replace(/\s/g, "")
-    );
-    if (!user) return { ok: false, error: "Identifiant introuvable. Vérifiez votre email, nom ou numéro de téléphone." };
-    if (user.password !== password) return { ok: false, error: "Mot de passe incorrect." };
-    if (!user.active) return { ok: false, error: "Ce compte est désactivé. Contactez l'administrateur." };
-    setCurrentUserId(user.id);
-    // Mettre à jour lastSeen
-    setUsers(us => us.map(u => u.id === user.id ? { ...u, lastSeen: Date.now() } : u));
-    return { ok: true };
-  };
-  const logout = () => { setCurrentUserId(null); localStorage.removeItem("hm_currentUser"); };
-  const isLoggedIn = !!currentUser;
-
-  const addCategory = (name: string) => {
-    const trimmed = name.trim();
-    if (!trimmed) return;
-    setCategories(cs => {
-      if (cs.some(c => c.toLowerCase() === trimmed.toLowerCase())) return cs;
-      return [...cs, trimmed].sort((a, b) => a.localeCompare(b, "fr"));
-    });
-  };
-  const deleteCategory = (name: string) => setCategories(cs => cs.filter(c => c !== name));
-  const renameCategory = (oldName: string, newName: string) => {
-    const trimmed = newName.trim();
-    if (!trimmed) return;
-    setCategories(cs => cs.map(c => c === oldName ? trimmed : c).sort((a, b) => a.localeCompare(b, "fr")));
-    setProducts(ps => ps.map(p => p.category === oldName ? { ...p, category: trimmed } : p));
-  };
-
-  // ---------- Exécuteur des actions validées ----------
-  const executeKind = (kind: ActionKind, payload: Record<string, unknown>) => {
-    const p = payload as never;
-    switch (kind) {
-      case "product.add": addProduct(payload as unknown as Omit<Product, "id">); break;
-      case "product.update": updateProduct((payload as { id: string }).id, (payload as { data: Partial<Product> }).data); break;
-      case "product.delete": deleteProduct((payload as { id: string }).id); break;
-      case "customer.add": addCustomer(payload as unknown as Omit<Customer, "id" | "totalPurchases" | "createdAt">); break;
-      case "customer.update": updateCustomer((payload as { id: string }).id, (payload as { data: Partial<Customer> }).data); break;
-      case "customer.delete": deleteCustomer((payload as { id: string }).id); break;
-      case "supplier.add": addSupplier(payload as unknown as Omit<Supplier, "id">); break;
-      case "supplier.update": updateSupplier((payload as { id: string }).id, (payload as { data: Partial<Supplier> }).data); break;
-      case "supplier.delete": deleteSupplier((payload as { id: string }).id); break;
-      case "user.add": addUser(payload as unknown as Omit<User, "id" | "createdAt">); break;
-      case "user.update": updateUser((payload as { id: string }).id, (payload as { data: Partial<User> }).data); break;
-      case "user.delete": deleteUser((payload as { id: string }).id); break;
-      case "loss.add": addLoss(payload as unknown as Omit<Loss, "id">); break;
-      case "loss.delete": deleteLoss((payload as { id: string }).id); break;
-      case "stock.adjust": adjustStock((payload as { productId: string }).productId, (payload as { delta: number }).delta); break;
-      case "inventory.do": doInventory((payload as { counts: { productId: string; productName: string; expected: number; actual: number }[] }).counts, (payload as { period: string }).period); break;
-      case "purchase.add": addPurchase((payload as { items: PurchaseItem[] }).items, (payload as { supplierId: string }).supplierId, (payload as { supplierName: string }).supplierName); break;
-      case "purchase.update": updatePurchase((payload as { id: string }).id, (payload as { data: Partial<Purchase> }).data); break;
-      case "purchase.delete": deletePurchase((payload as { id: string }).id); break;
-      case "profile.update": updateUser((payload as { id: string }).id, (payload as { data: Partial<User> }).data); break;
-    }
-    void p;
-  };
-
-  // Résout la page cible selon le type d'action
-  const kindToPage = (kind: ActionKind): string => {
-    if (kind.startsWith("product"))   return "products";
-    if (kind.startsWith("stock"))     return "stock";
-    if (kind.startsWith("customer"))  return "customers";
-    if (kind.startsWith("supplier"))  return "suppliers";
-    if (kind.startsWith("purchase"))  return "purchases";
-    if (kind.startsWith("loss"))      return "losses";
-    if (kind.startsWith("inventory")) return "inventory";
-    if (kind.startsWith("user"))      return "users";
-    if (kind.startsWith("profile"))   return "myspace";
-    return "dashboard";
-  };
-
-  const requestOrExec = (meta: {
-    kind: ActionKind;
-    module: string;
-    action: string;
-    description: string;
-    details?: Record<string, unknown>;
-    payload: Record<string, unknown>;
-  }): boolean => {
-    const adminUser = users.find(u => u.role === "admin");
-    const targetPage = kindToPage(meta.kind);
-
-    if (isAdmin) {
-      executeKind(meta.kind, meta.payload);
-      const generalKinds: ActionKind[] = [
-        "product.add", "product.update", "product.delete",
-        "customer.add", "customer.delete", "supplier.add", "supplier.delete",
-        "purchase.add",
-      ];
-      if (generalKinds.includes(meta.kind)) {
-        pushNotif("*",
-          `${meta.module} — ${meta.action}`,
-          `${meta.description} (par ${currentUser?.name || "Admin"}).`,
-          "info", "general",
-          currentUser?.id || "system", currentUser?.name || "Administrateur",
-          targetPage
-        );
-      }
-
-      // Notifier personnellement l'employé concerné si l'admin modifie son profil
-      if ((meta.kind === "user.update") && (meta.payload as { id: string }).id) {
-        const affectedId = (meta.payload as { id: string }).id;
-        if (affectedId !== currentUser?.id) {
-          // Admin modifie un autre utilisateur
-          const changedInfo = Object.entries(meta.details || {})
-            .filter(([k]) => k !== "employé" && k !== "rôle" && k !== "champs modifiés")
-            .map(([k, v]) => `${k} : ${String(v)}`)
-            .join(" | ");
-          pushNotif(
-            affectedId,
-            "Votre profil a été modifié",
-            `Des informations de votre compte ont été mises à jour par ${currentUser?.name}${changedInfo ? ` — ${changedInfo}` : ""}.`,
-            "info", "personal",
-            currentUser?.id || "system", currentUser?.name || "Administrateur",
-            "myspace"
-          );
+    (async () => {
+      // Identité de la boutique visible dès l'écran de connexion
+      api<Partial<ShopSettings>>("GET", "/public/shop")
+        .then(info => setShopSettings(prev => ({ ...prev, ...info, logo: info.logo || "" })))
+        .catch(() => { /* API injoignable : on garde les valeurs par défaut */ });
+      if (getToken()) {
+        try {
+          await loaders.me();
+          await refresh(...ALL_RESOURCES);
+        } catch {
+          setToken(null);
+          resetState();
         }
       }
+      setReady(true);
+    })();
+    return () => setUnauthorizedHandler(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ───────────────────────── Synchronisation périodique ─────────────────────────
+  const loggedIn = !!currentUser;
+  useEffect(() => {
+    if (!loggedIn) return;
+    const fast = setInterval(() => { void refresh("notifications", "pending", "online"); }, 20_000);
+    const slow = setInterval(() => { void refresh("me", "products", "customers", "sales", "purchases", "losses", "promotions", "cashSession"); }, 60_000);
+    const onVisible = () => { if (document.visibilityState === "visible") void refresh("me", ...ALL_RESOURCES); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { clearInterval(fast); clearInterval(slow); document.removeEventListener("visibilitychange", onVisible); };
+  }, [loggedIn, refresh]);
+
+  // ───────────────────────── Session ─────────────────────────
+  const login = async (identifier: string, password: string): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const r = await api<{ token: string; user: User; role: Role }>("POST", "/login", { identifier: identifier.trim(), password });
+      setToken(r.token);
+      setCurrentUser(r.user);
+      setCurrentUserRole(r.role);
+      roleRef.current = r.role;
+      userRef.current = r.user;
+      await refresh(...ALL_RESOURCES);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: errMsg(e) };
+    }
+  };
+
+  const logout = async () => {
+    try { await api("POST", "/logout"); } catch { /* jeton déjà invalide : peu importe */ }
+    setToken(null);
+    resetState();
+  };
+
+  const forgotPassword = async (identifier: string): Promise<{ ok: boolean; message: string }> => {
+    try {
+      const r = await api<{ message: string }>("POST", "/forgot-password", { identifier: identifier.trim() });
+      return { ok: true, message: r.message };
+    } catch (e) {
+      return { ok: false, message: errMsg(e) };
+    }
+  };
+
+  const verifyPassword = async (password: string): Promise<boolean> => {
+    try { await api("POST", "/me/verify-password", { password }); return true; }
+    catch (e) {
+      if (e instanceof ApiError && e.status === 422) return false;
+      push(errMsg(e), "error");
+      return false;
+    }
+  };
+
+  // ───────────────────────── Opérations soumises à validation ─────────────────────────
+  const requestOrExec = async (meta: ActionMeta): Promise<ActionResult> => {
+    try {
+      const r = await api<{ executed: boolean; affects: string[] }>("POST", "/actions", meta);
+      await refresh(...(r.affects as Resource[]), "notifications");
+      return r.executed ? "done" : "pending";
+    } catch (e) {
+      push(errMsg(e), "error");
+      return "error";
+    }
+  };
+
+  const approveAction = async (id: string): Promise<boolean> => {
+    try {
+      const r = await api<{ affects: string[] }>("POST", `/pending-actions/${id}/approve`);
+      await refresh(...(r.affects as Resource[]), "notifications");
       return true;
-    }
-
-    // Employé : crée une demande en attente
-    const pa: PendingAction = {
-      id: uid("pa"), kind: meta.kind, module: meta.module, action: meta.action,
-      description: meta.description, details: meta.details || {}, payload: meta.payload,
-      date: new Date().toISOString().slice(0, 10), status: "pending",
-      requestedBy: currentUser?.id || "", requestedByName: currentUser?.name || "",
-    };
-    setPendingActions(ps => [pa, ...ps]);
-
-    // Notifie l'admin → le clic l'amène dans "Mon espace > Validations"
-    if (adminUser) {
-      pushNotif(
-        adminUser.id,
-        "Nouvelle demande en attente",
-        `${currentUser?.name} demande : « ${meta.action} » — ${meta.description}`,
-        "warning", "personal",
-        currentUser?.id || "system", currentUser?.name || "Employé",
-        "myspace"  // ← l'admin sera redirigé vers Mon espace (onglet validations)
-      );
-    }
-    return false;
-  };
-
-  const approveAction = (id: string) => {
-    const pa = pendingActions.find(a => a.id === id);
-    if (!pa) return;
-    const targetPage = kindToPage(pa.kind);
-
-    // 1. Exécuter l'action
-    executeKind(pa.kind, pa.payload);
-
-    // 2. Changer le statut
-    setPendingActions(ps => ps.map(a => a.id === id ? {
-      ...a, status: "approved",
-      reviewedBy: currentUser?.id, reviewedByName: currentUser?.name,
-      reviewedDate: new Date().toISOString().slice(0, 10),
-    } : a));
-
-    // 3. Notifier le demandeur → clic le renvoie sur la page modifiée
-    pushNotif(
-      pa.requestedBy,
-      "Demande approuvée ✓",
-      `Votre demande « ${pa.action} » (${pa.description}) a été approuvée et appliquée par ${currentUser?.name || "l'administrateur"}.`,
-      "success", "personal",
-      currentUser?.id || "system", currentUser?.name || "Administrateur",
-      targetPage  // ← l'employé voit directement la page concernée
-    );
-
-    // 4. Notification générale → tous les employés, clic → page concernée
-    const generalKinds: ActionKind[] = [
-      "product.add", "product.update", "product.delete",
-      "customer.add", "customer.delete", "supplier.add", "supplier.delete",
-      "stock.adjust", "loss.add", "inventory.do", "purchase.add",
-    ];
-    if (generalKinds.includes(pa.kind)) {
-      pushNotif("*",
-        `${pa.module} — ${pa.action}`,
-        `${pa.description} (demandé par ${pa.requestedByName}, approuvé par ${currentUser?.name}).`,
-        "info", "general",
-        currentUser?.id || "system", currentUser?.name || "Administrateur",
-        targetPage
-      );
-    }
-
-    // 5. Notifier personnellement l'employé concerné par une modification de compte/profil
-    if (pa.kind === "user.update" || pa.kind === "profile.update") {
-      const affectedUserId = (pa.payload as { id: string }).id;
-      if (affectedUserId && affectedUserId !== pa.requestedBy) {
-        // L'admin a modifié un autre employé — notifier cet employé
-        pushNotif(
-          affectedUserId,
-          "Votre profil a été modifié",
-          `Des informations de votre compte ont été mises à jour par ${currentUser?.name}. Consultez votre espace pour voir les détails.`,
-          "info", "personal",
-          currentUser?.id || "system", currentUser?.name || "Administrateur",
-          "myspace"
-        );
-      }
-      // Si c'est l'employé lui-même qui avait demandé (profile.update)
-      if (pa.kind === "user.update" && affectedUserId === pa.requestedBy) {
-        // La notif "approuvée" suffit
-      }
+    } catch (e) {
+      push(errMsg(e), "error");
+      await refresh("pending");
+      return false;
     }
   };
 
-  const rejectAction = (id: string, reason: string) => {
-    const pa = pendingActions.find(a => a.id === id);
-    if (!pa) return;
-
-    setPendingActions(ps => ps.map(a => a.id === id ? {
-      ...a, status: "rejected",
-      reviewedBy: currentUser?.id, reviewedByName: currentUser?.name,
-      reviewedDate: new Date().toISOString().slice(0, 10),
-      rejectReason: reason || undefined,
-    } : a));
-
-    // Notifier le demandeur → clic renvoie vers Mon espace pour voir le motif
-    pushNotif(
-      pa.requestedBy,
-      "Demande refusée ✗",
-      `Votre demande « ${pa.action} » (${pa.description}) a été refusée par ${currentUser?.name || "l'administrateur"}${reason ? " : " + reason : "."}`,
-      "error", "personal",
-      currentUser?.id || "system", currentUser?.name || "Administrateur",
-      "myspace"  // ← l'employé peut consulter le motif dans son espace
-    );
+  const rejectAction = async (id: string, reason: string): Promise<boolean> => {
+    try {
+      await api("POST", `/pending-actions/${id}/reject`, { reason: reason || null });
+      await refresh("pending", "notifications");
+      return true;
+    } catch (e) {
+      push(errMsg(e), "error");
+      await refresh("pending");
+      return false;
+    }
   };
 
-  // Réduit une image (data URL) à une petite miniature via canvas,
-  // afin de pouvoir l'afficher dans les requêtes sans alourdir le stockage.
+  // ───────────────────────── Ventes ─────────────────────────
+  const addSale = async (items: CartLine[], customerId?: string, paymentMethod = "Espèces", paid?: number): Promise<Sale | null> => {
+    try {
+      const r = await api<{ sale: Sale; products: Product[] }>("POST", "/sales", {
+        items: items.map(i => ({ productId: i.productId, quantity: i.quantity, discountPercent: i.discountPercent || 0 })),
+        customerId: customerId || null,
+        paymentMethod,
+        paid: paid ?? null,
+      });
+      await refresh("products", "sales", "customers", "notifications", "cashSession", "promotions");
+      return r.sale;
+    } catch (e) {
+      push(errMsg(e), "error");
+      await refresh("products", "promotions", "cashSession"); // stock / promotions / caisse affichés peut-être périmés
+      return null;
+    }
+  };
+
+  // ───────────────────────── Caisse : sessions et créances ─────────────────────────
+  const openCashSession = async (openingFloat: number): Promise<boolean> => {
+    try {
+      await api("POST", "/cash-sessions", { openingFloat });
+      await refresh("cashSession");
+      return true;
+    } catch (e) { push(errMsg(e), "error"); return false; }
+  };
+
+  const closeCashSession = async (id: string, countedCash: number, note: string): Promise<CashSession | null> => {
+    try {
+      const closed = await api<CashSession>("POST", `/cash-sessions/${id}/close`, { countedCash, note: note || null });
+      await refresh("cashSession", "notifications");
+      return closed;
+    } catch (e) { push(errMsg(e), "error"); return null; }
+  };
+
+  const settleCustomer = async (customerId: string, data: { amount: number; method: string; saleId?: string; note?: string }): Promise<boolean> => {
+    try {
+      await api("POST", `/customers/${customerId}/payments`, {
+        amount: data.amount, method: data.method, saleId: data.saleId || null, note: data.note || null,
+      });
+      await refresh("customers", "sales", "cashSession");
+      return true;
+    } catch (e) { push(errMsg(e), "error"); return false; }
+  };
+
+  // ───────────────────────── Rôles / paramètres / catégories ─────────────────────────
+  const addRole = async (r: Pick<Role, "name" | "description" | "permissions">): Promise<Role | null> => {
+    try {
+      const created = await api<Role>("POST", "/roles", r);
+      await refresh("roles");
+      return created;
+    } catch (e) { push(errMsg(e), "error"); return null; }
+  };
+  const updateRole = async (id: string, r: Pick<Role, "name" | "description" | "permissions">): Promise<boolean> => {
+    try {
+      await api("PUT", `/roles/${id}`, r);
+      await refresh("roles", "me");
+      return true;
+    } catch (e) { push(errMsg(e), "error"); return false; }
+  };
+  const deleteRole = async (id: string): Promise<boolean> => {
+    try {
+      await api("DELETE", `/roles/${id}`);
+      await refresh("roles");
+      return true;
+    } catch (e) { push(errMsg(e), "error"); return false; }
+  };
+
+  const updateShopSettings = async (s: Partial<ShopSettings>): Promise<boolean> => {
+    try {
+      setShopSettings({ ...DEFAULT_SETTINGS, ...(await api<ShopSettings>("PUT", "/settings", s)) });
+      return true;
+    } catch (e) { push(errMsg(e), "error"); return false; }
+  };
+
+  const categories = categoryRows.map(c => c.name);
+  const catId = (name: string) => categoryRows.find(c => c.name === name)?.id;
+
+  const addCategory = async (name: string): Promise<boolean> => {
+    try { await api("POST", "/categories", { name }); await refresh("categories"); return true; }
+    catch (e) { push(errMsg(e), "error"); return false; }
+  };
+  const deleteCategory = async (name: string): Promise<boolean> => {
+    const id = catId(name);
+    if (!id) return false;
+    try { await api("DELETE", `/categories/${id}`); await refresh("categories", "products"); return true; }
+    catch (e) { push(errMsg(e), "error"); return false; }
+  };
+  const renameCategory = async (oldName: string, newName: string): Promise<boolean> => {
+    const id = catId(oldName);
+    if (!id) return false;
+    try { await api("PUT", `/categories/${id}`, { name: newName }); await refresh("categories", "products"); return true; }
+    catch (e) { push(errMsg(e), "error"); return false; }
+  };
+
+  // ───────────────────────── Notifications ─────────────────────────
+  const unreadCount = notifications.filter(n => !n.read).length;
+  const markRead = (id: string) => {
+    setNotifications(ns => ns.map(n => n.id === id ? { ...n, read: true } : n));
+    api("POST", `/notifications/${id}/read`).catch(() => void refresh("notifications"));
+  };
+  const markAllRead = () => {
+    setNotifications(ns => ns.map(n => ({ ...n, read: true })));
+    api("POST", "/notifications/read-all").catch(() => void refresh("notifications"));
+  };
+
+  // ───────────────────────── Profil ─────────────────────────
+  // Réduit une image (data URL) à une petite miniature via canvas (comparaison avant/après pour l'admin).
   const makeAvatarPreview = (dataUrl: string, maxSize = 220): Promise<string> =>
     new Promise((resolve) => {
       if (!dataUrl) { resolve(""); return; }
@@ -594,11 +486,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       img.src = dataUrl;
     });
 
-  const updateProfile = async (data: { name?: string; email?: string; password?: string; avatar?: string }): Promise<boolean> => {
-    if (!currentUser) return false;
+  const updateProfile = async (data: { name?: string; email?: string; password?: string; avatar?: string }): Promise<ActionResult> => {
+    if (!currentUser) return "error";
     const clean: Partial<User> = {};
-
-    // Construire les détails lisibles des champs modifiés pour l'admin
     const changedFields: Record<string, { avant: string; après: string }> = {};
     if (data.name !== undefined && data.name !== currentUser.name) {
       clean.name = data.name;
@@ -612,7 +502,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       clean.password = data.password;
       changedFields["Mot de passe"] = { avant: "••••••••", après: "Nouveau mot de passe défini" };
     }
-    const avatarChanged = data.avatar !== undefined && data.avatar !== currentUser.avatar;
+    const avatarChanged = data.avatar !== undefined && data.avatar !== (currentUser.avatar ?? "");
     if (avatarChanged) {
       clean.avatar = data.avatar;
       changedFields["Photo de profil"] = {
@@ -621,23 +511,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       };
     }
 
-    if (Object.keys(clean).length === 0) return true; // Rien à changer
+    if (Object.keys(clean).length === 0) return "done"; // Rien à changer
 
-    // L'ancienne photo (miniature) est conservée dans les détails
-    // pour que l'admin puisse comparer avant/après avant de statuer.
+    // L'ancienne photo (miniature) est conservée dans les détails pour que l'admin compare avant/après.
     const avatarAvant = avatarChanged
       ? currentUser.avatar ? await makeAvatarPreview(currentUser.avatar) : ""
       : undefined;
 
-    // Tableau des champs modifiés (hors photo, affichée séparément en comparatif)
     const changesTable = Object.entries(changedFields)
       .filter(([field]) => field !== "Photo de profil")
       .map(([field, v]) => ({ champ: field, avant: v.avant, après: v.après }));
 
-    const details: Record<string, unknown> = {
-      employé: currentUser.name,
-      changes: changesTable,
-    };
+    const details: Record<string, unknown> = { employé: currentUser.name, changes: changesTable };
     if (avatarChanged) details.avatar_avant = avatarAvant ?? "";
 
     return requestOrExec({
@@ -650,45 +535,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     });
   };
 
-  // ---------- Surveillance du stock critique ----------
-  useEffect(() => {
-    const low = products.filter(p => p.stock > 0 && p.stock <= p.minStock);
-    if (low.length === 0) return;
-    // Ne notifier que si la notif n'existe pas encore pour aujourd'hui (évite les doublons)
-    const todayStr = new Date().toISOString().slice(0, 10);
-    const alreadyNotified = notifications.some(n => n.triggeredById === "system" && n.title.includes("Stock critique") && new Date(n.date).toISOString().slice(0, 10) === todayStr);
-    if (alreadyNotified) return;
-    const names = low.slice(0, 5).map(p => `${p.name} (${p.stock} restant${p.stock > 1 ? "s" : ""})`).join(", ");
-    pushNotif("*", "Stock critique", `${low.length} article${low.length > 1 ? "s" : ""} en stock critique : ${names}.`, "warning", "general", "system", "Système", "stock", undefined);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // ---------- Présence en ligne ----------
-  useEffect(() => {
-    if (!currentUserId) return;
-    const ping = () => setUsers(us => us.map(u => u.id === currentUserId ? { ...u, lastSeen: Date.now() } : u));
-    ping();
-    const iv = setInterval(ping, 30000);
-    return () => clearInterval(iv);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentUserId]);
-  const onlineUsers = users.filter(u => u.lastSeen && Date.now() - u.lastSeen < 120000).map(u => u.id);
+  const pendingCount = pendingActions.filter(a => a.status === "pending").length;
 
   return (
     <StoreContext.Provider value={{
-      products, sales, purchases, customers, suppliers, users, losses, inventory, roles, shopSettings, categories, currentUser, currentUserRole,
-      canAccess, roleName, isAdmin,
-      addProduct, updateProduct, deleteProduct, addSale, addPurchase, updatePurchase, deletePurchase,
-      addCustomer, updateCustomer, deleteCustomer,
-      addSupplier, updateSupplier, deleteSupplier,
-      addUser, updateUser, deleteUser,
-      addRole, updateRole, deleteRole,
-      addLoss, deleteLoss, doInventory, adjustStock,
-      updateShopSettings,
-      addCategory, deleteCategory, renameCategory,
-      login, logout, isLoggedIn,
+      ready,
+      products, sales, purchases, customers, suppliers, users, losses, inventory, roles, promotions, cashSession, shopSettings, categories,
+      categoryList: categoryRows.map(c => ({ id: c.id, name: c.name })),
+      currentUser, currentUserRole, canAccess, roleName, isAdmin,
+      login, logout, forgotPassword, verifyPassword, isLoggedIn: !!currentUser, refresh,
       pendingActions, pendingCount, approveAction, rejectAction, requestOrExec,
-      notifications, myNotifications, unreadCount, markAllRead, markRead, notifyAll, updateProfile, makeAvatarPreview, onlineUsers
+      notifications, myNotifications: notifications, unreadCount, markAllRead, markRead,
+      updateProfile, makeAvatarPreview, onlineUsers,
+      addSale, openCashSession, closeCashSession, settleCustomer, addRole, updateRole, deleteRole, updateShopSettings,
+      addCategory, deleteCategory, renameCategory,
     }}>
       {children}
     </StoreContext.Provider>

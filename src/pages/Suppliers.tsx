@@ -17,14 +17,16 @@ export default function Suppliers() {
 
   const openAdd = () => { setEditing(null); setForm({}); setOpen(true); };
   const openEdit = (s: Supplier) => { setEditing(s); setForm({ ...s }); setOpen(true); };
-  const save = () => {
+  const save = async () => {
     if (!form.name) return push("Le nom est requis", "error");
     if (editing) {
-      const ok = requestOrExec({ kind: "supplier.update", module: "Fournisseurs", action: "Modifier un fournisseur", description: `Modification de « ${form.name} »`, details: { nom: form.name || "" }, payload: { id: editing.id, data: form } });
-      push(ok ? "Fournisseur modifié" : "Action en attente de validation");
+      const ok = await requestOrExec({ kind: "supplier.update", module: "Fournisseurs", action: "Modifier un fournisseur", description: `Modification de « ${form.name} »`, details: { nom: form.name || "" }, payload: { id: editing.id, data: form } });
+      if (ok === "error") return;
+    push(ok === "done" ? "Fournisseur modifié" : "Action en attente de validation");
     } else {
-      const ok = requestOrExec({ kind: "supplier.add", module: "Fournisseurs", action: "Ajouter un fournisseur", description: `Nouveau fournisseur « ${form.name} »`, details: { nom: form.name || "", contact: form.contact || "" }, payload: form });
-      push(ok ? "Fournisseur ajouté" : "Action en attente de validation");
+      const ok = await requestOrExec({ kind: "supplier.add", module: "Fournisseurs", action: "Ajouter un fournisseur", description: `Nouveau fournisseur « ${form.name} »`, details: { nom: form.name || "", contact: form.contact || "" }, payload: form });
+      if (ok === "error") return;
+    push(ok === "done" ? "Fournisseur ajouté" : "Action en attente de validation");
     }
     setOpen(false);
   };
@@ -36,8 +38,9 @@ export default function Suppliers() {
       variant: "danger",
     });
     if (!ok) return;
-    const ok2 = requestOrExec({ kind: "supplier.delete", module: "Fournisseurs", action: "Supprimer un fournisseur", description: `Suppression de « ${s.name} »`, details: { nom: s.name }, payload: { id: s.id } });
-    push(ok2 ? "Fournisseur supprimé" : "Action en attente de validation");
+    const ok2 = await requestOrExec({ kind: "supplier.delete", module: "Fournisseurs", action: "Supprimer un fournisseur", description: `Suppression de « ${s.name} »`, details: { nom: s.name }, payload: { id: s.id } });
+    if (ok2 === "error") return;
+    push(ok2 === "done" ? "Fournisseur supprimé" : "Action en attente de validation");
     if (detailId === s.id) setDetailId(null);
   };
 

@@ -14,8 +14,8 @@ return new class extends Migration
             $table->foreignId('category_id')->nullable()->constrained()->nullOnDelete();
             $table->decimal('price', 14, 2);                // prix de vente
             $table->decimal('cost', 14, 2)->default(0);     // coût d'achat
-            $table->integer('stock')->default(0);
-            $table->integer('min_stock')->default(5);
+            $table->decimal('stock', 12, 3)->default(0);     // décimal : vente au poids (kg, L...)
+            $table->decimal('min_stock', 12, 3)->default(5);
             $table->string('unit', 30)->default('pièce');
             $table->string('barcode', 50)->nullable()->unique();
             $table->date('expiry_date')->nullable();

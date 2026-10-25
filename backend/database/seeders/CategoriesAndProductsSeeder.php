@@ -2,35 +2,42 @@
 
 namespace Database\Seeders;
 
+use App\Models\Category;
+use App\Models\Product;
 use Illuminate\Database\Seeder;
-use Illuminate\Support\Facades\DB;
 
 class CategoriesAndProductsSeeder extends Seeder
 {
     public function run(): void
     {
-        $now = now();
-
-        $cats = ['Epicerie', 'Boissons', 'Laitier', 'Boulangerie', 'Hygiène', 'Frais', 'Divers'];
-        foreach ($cats as $c) {
-            DB::table('categories')->insert(['name' => $c, 'created_at' => $now, 'updated_at' => $now]);
+        foreach (['Epicerie', 'Boissons', 'Laitier', 'Boulangerie', 'Hygiène', 'Frais', 'Divers'] as $c) {
+            Category::firstOrCreate(['name' => $c]);
         }
+        $cat = Category::pluck('id', 'name');
 
-        $catMap = DB::table('categories')->pluck('id', 'name');
+        $in = fn (int $days) => today()->addDays($days)->toDateString();
 
-        DB::table('products')->insert([
-            ['name' => 'Riz Basmati 5kg',    'category_id' => $catMap['Epicerie'],    'price' => 8500,  'cost' => 6500,  'stock' => 45, 'min_stock' => 10, 'unit' => 'pièce', 'created_at' => $now, 'updated_at' => $now],
-            ['name' => 'Huile Dinor 1L',      'category_id' => $catMap['Epicerie'],    'price' => 2200,  'cost' => 1700,  'stock' => 80, 'min_stock' => 20, 'unit' => 'pièce', 'created_at' => $now, 'updated_at' => $now],
-            ['name' => 'Sucre en poudre 1kg', 'category_id' => $catMap['Epicerie'],    'price' => 950,   'cost' => 700,   'stock' => 120,'min_stock' => 30, 'unit' => 'pièce', 'created_at' => $now, 'updated_at' => $now],
-            ['name' => 'Lait Bridel 1L',      'category_id' => $catMap['Laitier'],     'price' => 1500,  'cost' => 1100,  'stock' => 35, 'min_stock' => 15, 'unit' => 'pièce', 'created_at' => $now, 'updated_at' => $now],
-            ['name' => 'Yaourt Gervais x6',   'category_id' => $catMap['Laitier'],     'price' => 1800,  'cost' => 1350,  'stock' => 25, 'min_stock' => 10, 'unit' => 'pièce', 'created_at' => $now, 'updated_at' => $now],
-            ['name' => 'Coca-Cola 1.5L',      'category_id' => $catMap['Boissons'],    'price' => 1250,  'cost' => 950,   'stock' => 60, 'min_stock' => 20, 'unit' => 'pièce', 'created_at' => $now, 'updated_at' => $now],
-            ['name' => 'Eau Cristaline 1.5L', 'category_id' => $catMap['Boissons'],    'price' => 350,   'cost' => 200,   'stock' => 200,'min_stock' => 50, 'unit' => 'pièce', 'created_at' => $now, 'updated_at' => $now],
-            ['name' => 'Pain de mie',          'category_id' => $catMap['Boulangerie'], 'price' => 800,   'cost' => 550,   'stock' => 18, 'min_stock' => 8,  'unit' => 'pièce', 'created_at' => $now, 'updated_at' => $now],
-            ['name' => 'Savon Lifebuoy',       'category_id' => $catMap['Hygiène'],     'price' => 650,   'cost' => 450,   'stock' => 55, 'min_stock' => 15, 'unit' => 'pièce', 'created_at' => $now, 'updated_at' => $now],
-            ['name' => 'Lessive Omo 2kg',      'category_id' => $catMap['Hygiène'],     'price' => 3200,  'cost' => 2400,  'stock' => 22, 'min_stock' => 8,  'unit' => 'pièce', 'created_at' => $now, 'updated_at' => $now],
-            ['name' => 'Pâtes Panzani 500g',   'category_id' => $catMap['Epicerie'],    'price' => 750,   'cost' => 550,   'stock' => 90, 'min_stock' => 25, 'unit' => 'pièce', 'created_at' => $now, 'updated_at' => $now],
-            ['name' => 'Tomate concentrée',    'category_id' => $catMap['Epicerie'],    'price' => 450,   'cost' => 320,   'stock' => 5,  'min_stock' => 20, 'unit' => 'pièce', 'created_at' => $now, 'updated_at' => $now],
-        ]);
+        // nom, catégorie, prix, coût, stock, seuil, code-barres, péremption
+        $rows = [
+            ['Riz Basmati 5kg',     'Epicerie',    8500, 6500,  45, 10, '100001', $in(30)],
+            ['Huile Dinor 1L',      'Epicerie',    2200, 1700,  80, 20, '100002', $in(30)],
+            ['Sucre en poudre 1kg', 'Epicerie',     950,  700, 120, 30, '100003', null],
+            ['Lait Bridel 1L',      'Laitier',     1500, 1100,  35, 15, '100004', $in(-20)],
+            ['Yaourt Gervais x6',   'Laitier',     1800, 1350,  25, 10, '100005', $in(0)],
+            ['Coca-Cola 1.5L',      'Boissons',    1250,  950,  60, 20, '100006', null],
+            ['Eau Cristaline 1.5L', 'Boissons',     350,  200, 200, 50, '100007', null],
+            ['Pain de mie',         'Boulangerie',  800,  550,  18,  8, '100008', $in(0)],
+            ['Savon Lifebuoy',      'Hygiène',      650,  450,  55, 15, '100009', null],
+            ['Lessive Omo 2kg',     'Hygiène',     3200, 2400,  22,  8, '100010', null],
+            ['Pâtes Panzani 500g',  'Epicerie',     750,  550,  90, 25, '100011', null],
+            ['Tomate concentrée',   'Epicerie',     450,  320,   5, 20, '100012', null],
+        ];
+
+        foreach ($rows as [$name, $category, $price, $cost, $stock, $min, $barcode, $expiry]) {
+            Product::updateOrCreate(['barcode' => $barcode], [
+                'name' => $name, 'category_id' => $cat[$category], 'price' => $price, 'cost' => $cost,
+                'stock' => $stock, 'min_stock' => $min, 'unit' => 'pièce', 'expiry_date' => $expiry,
+            ]);
+        }
     }
 }

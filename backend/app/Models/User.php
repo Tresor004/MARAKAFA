@@ -16,15 +16,16 @@ class User extends Authenticatable
 
     protected $fillable = [
         'name', 'email', 'phone', 'password',
-        'role_id', 'active', 'avatar_path', 'last_seen_at',
+        'role_id', 'active', 'avatar', 'last_seen_at',
     ];
 
     protected $hidden = ['password', 'remember_token'];
 
     protected $casts = [
-        'active'       => 'boolean',
-        'last_seen_at' => 'datetime',
+        'active'            => 'boolean',
+        'last_seen_at'      => 'datetime',
         'email_verified_at' => 'datetime',
+        'password'          => 'hashed',
     ];
 
     // ── Relations ──────────────────────────────────────────────
@@ -48,11 +49,6 @@ class User extends Authenticatable
         return $this->hasMany(Loss::class, 'noted_by');
     }
 
-    public function notifications(): HasMany
-    {
-        return $this->hasMany(AppNotification::class);
-    }
-
     public function pendingActions(): HasMany
     {
         return $this->hasMany(PendingAction::class, 'requested_by');
@@ -61,7 +57,7 @@ class User extends Authenticatable
     // ── Helpers ────────────────────────────────────────────────
     public function isAdmin(): bool
     {
-        return $this->role?->name === 'Administrateur';
+        return (bool) $this->role?->isAdmin();
     }
 
     public function hasPermission(string $key): bool
@@ -74,9 +70,9 @@ class User extends Authenticatable
         return $this->last_seen_at && $this->last_seen_at->diffInSeconds(now()) < 120;
     }
 
-    /** Accesseur pour l'URL publique de l'avatar */
-    public function getAvatarUrlAttribute(): ?string
+    /** Normalise un numéro de téléphone pour la comparaison (chiffres uniquement). */
+    public static function normalizePhone(?string $phone): string
     {
-        return $this->avatar_path ? asset('storage/' . $this->avatar_path) : null;
+        return preg_replace('/\D+/', '', (string) $phone) ?? '';
     }
 }
